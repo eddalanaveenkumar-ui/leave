@@ -10,6 +10,17 @@ import time
 import string
 import json
 
+# ── Firebase Admin SDK (for sending push notifications) ──────────────────────
+try:
+    import firebase_admin
+    from firebase_admin import credentials, messaging as fcm_messaging
+    _FCM_AVAILABLE = True
+except ImportError:
+    _FCM_AVAILABLE = False
+    print("[WARN] firebase-admin not installed. Push notifications disabled.")
+    print("       Run: pip install firebase-admin")
+
+
 app = Flask(__name__)
 CORS(app)
 
@@ -107,6 +118,7 @@ class MockDB:
         self.users = MockCollection()
         self.leave_requests = MockCollection()
         self.otps = MockCollection()
+        self.fcm_tokens = MockCollection()  # FCM device tokens
 
 # --- MongoDB Setup ---
 MONGO_URI = "mongodb+srv://eddalanaveen893_db_user:Naveen1234@triangle.zkuc3ku.mongodb.net/?appName=triangle" 
@@ -122,6 +134,79 @@ except Exception as e:
     print(f"Error connecting to MongoDB: {e}")
     print("--- SWITCHING TO MOCK DATABASE (IN-MEMORY) ---")
     db = MockDB()
+
+# ── Initialize Firebase Admin SDK ─────────────────────────────────────────────
+_firebase_initialized = False
+
+def _init_firebase():
+    global _firebase_initialized
+    if not _FCM_AVAILABLE or _firebase_initialized:
+        return
+    try:
+        # Option 1: Use GOOGLE_APPLICATION_CREDENTIALS env var (production)
+        cred_path = os.environ.get('FIREBASE_SERVICE_ACCOUNT_JSON')
+        if cred_path and os.path.exists(cred_path):
+            cred = credentials.Certificate(cred_path)
+        else:
+            # Option 2: Inline service account (fallback for dev — keep this file out of git)
+            sa_path = os.path.join(os.path.dirname(__file__), 'firebase-service-account.json')
+            if os.path.exists(sa_path):
+                cred = credentials.Certificate(sa_path)
+            else:
+                print("[FCM] No service account found. Push notifications disabled.")
+                print("[FCM] Provide firebase-service-account.json next to app.py.")
+                return
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app(cred)
+        _firebase_initialized = True
+        print("[FCM] Firebase Admin SDK initialized ✓")
+    except Exception as e:
+        print(f"[FCM] Firebase init error: {e}")
+
+_init_firebase()
+
+# ── Helper: send push notification via FCM ────────────────────────────────────
+def send_push(token: str, title: str, body: str, data: dict = None) -> bool:
+    """Send a single push notification to a device token. Returns True on success."""
+    if not _firebase_initialized:
+        return False
+    try:
+        msg = fcm_messaging.Message(
+            notification=fcm_messaging.Notification(title=title, body=body),
+            data={k: str(v) for k, v in (data or {}).items()},
+            android=fcm_messaging.AndroidConfig(
+                priority='high',
+                notification=fcm_messaging.AndroidNotification(
+                    sound='default',
+                    channel_id=data.get('channel_id', 'leavesync_student') if data else 'leavesync_student',
+                    click_action='FLUTTER_NOTIFICATION_CLICK'
+                )
+            ),
+            apns=fcm_messaging.APNSConfig(
+                payload=fcm_messaging.APNSPayload(
+                    aps=fcm_messaging.Aps(sound='default', badge=1)
+                )
+            ),
+            token=token
+        )
+        fcm_messaging.send(msg)
+        return True
+    except Exception as e:
+        print(f"[FCM] Send error for token {token[:20]}...: {e}")
+        return False
+
+def send_push_to_user(user_id: str, title: str, body: str, data: dict = None):
+    """Send push to ALL devices registered for a userId."""
+    tokens = list(db.fcm_tokens.find({'userId': user_id}))
+    for t in tokens:
+        send_push(t['token'], title, body, data)
+
+def send_push_to_role(role: str, title: str, body: str, data: dict = None):
+    """Broadcast push to all devices of users with a given role."""
+    tokens = list(db.fcm_tokens.find({'role': role}))
+    for t in tokens:
+        send_push(t['token'], title, body, data)
+
 
 # --- Helper to serialize MongoDB objects ---
 def serialize_doc(doc):
@@ -159,6 +244,101 @@ if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
 
 
 # --- API Endpoints ---
+
+# ══════════════════════════════════════════════════════════════════
+#  PUSH NOTIFICATION ENDPOINTS
+# ══════════════════════════════════════════════════════════════════
+
+@app.route('/api/save-fcm-token', methods=['POST'])
+def save_fcm_token():
+    """Called by each app on startup/permission grant to register the device FCM token."""
+    try:
+        data = request.json
+        token   = data.get('token')
+        role    = data.get('role', 'student')   # student | staff | parent | admin
+        user_id = data.get('userId', '')
+
+        if not token:
+            return jsonify({'error': 'Token required'}), 400
+
+        # Upsert: one token entry per device token
+        record = {
+            'token'    : token,
+            'role'     : role,
+            'userId'   : str(user_id),
+            'updatedAt': datetime.now()
+        }
+
+        # Use real MongoDB upsert if available
+        try:
+            db.fcm_tokens.update_one(
+                {'token': token},
+                {'$set': record},
+                upsert=True
+            )
+        except AttributeError:
+            # MockDB fallback
+            existing = db.fcm_tokens.find_one({'token': token})
+            if not existing:
+                db.fcm_tokens.insert_one(record)
+
+        print(f"[FCM] Token saved for role={role} userId={user_id}")
+        return jsonify({'message': 'Token saved', 'status': 'ok'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/send-notification', methods=['POST'])
+def send_notification():
+    """Send push to a specific user by userId OR to all users of a role."""
+    try:
+        data    = request.json
+        title   = data.get('title', 'LeaveSync')
+        body    = data.get('body', '')
+        user_id = data.get('userId')          # optional: specific user
+        role    = data.get('role')             # optional: broadcast to role
+        tag     = data.get('tag', 'default')  # approved | rejected | pending | submitted
+        url     = data.get('url', '/')
+
+        push_data = {'tag': tag, 'url': url}
+
+        sent = 0
+        if user_id:
+            tokens = list(db.fcm_tokens.find({'userId': str(user_id)}))
+            for t in tokens:
+                if send_push(t['token'], title, body, push_data): sent += 1
+        elif role:
+            tokens = list(db.fcm_tokens.find({'role': role}))
+            for t in tokens:
+                if send_push(t['token'], title, body, push_data): sent += 1
+        else:
+            return jsonify({'error': 'Provide userId or role'}), 400
+
+        return jsonify({'message': f'{sent} notification(s) sent', 'sent': sent})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/send-notification/broadcast', methods=['POST'])
+def broadcast_notification():
+    """Broadcast to ALL registered devices (e.g. system announcements from Admin)."""
+    try:
+        data  = request.json
+        title = data.get('title', 'LeaveSync')
+        body  = data.get('body', '')
+        tag   = data.get('tag', 'default')
+
+        all_tokens = list(db.fcm_tokens.find({}))
+        sent = 0
+        for t in all_tokens:
+            if send_push(t['token'], title, body, {'tag': tag}): sent += 1
+
+        return jsonify({'message': f'Broadcast sent to {sent} device(s)', 'sent': sent})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# --- Login Endpoints ---
 
 @app.route('/api/login/otp', methods=['POST'])
 def send_login_otp():
@@ -512,14 +692,25 @@ def get_parent_requests():
 
 @app.route('/api/parent/approve', methods=['POST'])
 def parent_approve():
-    data = request.json
+    data   = request.json
     req_id = data.get('request_id')
-    
+
     db.leave_requests.update_one(
-        {"_id": ObjectId(req_id)},
-        {"$set": {"status": "pending_mentor", "parent_approved": True}}
+        {'_id': ObjectId(req_id)},
+        {'$set': {'status': 'pending_mentor', 'parent_approved': True}}
     )
-    return jsonify({"message": "Approved by Parent. Sent to Mentor."})
+
+    # Push to student
+    try:
+        req = db.leave_requests.find_one({'_id': ObjectId(req_id)})
+        if req:
+            send_push_to_user(req['student_id'],
+                '✅ Parent Approved',
+                'Your parent approved your leave. Sent to class advisor.',
+                {'tag': 'approved', 'url': '/dashboard.html'})
+    except Exception: pass
+
+    return jsonify({'message': 'Approved by Parent. Sent to Mentor.'})
 
 @app.route('/api/mentor/requests', methods=['GET'])
 def get_mentor_requests():
@@ -528,14 +719,25 @@ def get_mentor_requests():
 
 @app.route('/api/mentor/approve', methods=['POST'])
 def mentor_approve():
-    data = request.json
+    data   = request.json
     req_id = data.get('request_id')
-    
+
     db.leave_requests.update_one(
-        {"_id": ObjectId(req_id)},
-        {"$set": {"status": "pending_hod", "mentor_approved": True}}
+        {'_id': ObjectId(req_id)},
+        {'$set': {'status': 'pending_hod', 'mentor_approved': True}}
     )
-    return jsonify({"message": "Approved by Mentor. Sent to HOD."})
+
+    # Push to student
+    try:
+        req = db.leave_requests.find_one({'_id': ObjectId(req_id)})
+        if req:
+            send_push_to_user(req['student_id'],
+                '⏳ Advisor Approved',
+                'Your class advisor approved your leave. Awaiting HOD approval.',
+                {'tag': 'pending', 'url': '/dashboard.html'})
+    except Exception: pass
+
+    return jsonify({'message': 'Approved by Mentor. Sent to HOD.'})
 
 @app.route('/api/hod/requests', methods=['GET'])
 def get_hod_requests():
@@ -545,27 +747,42 @@ def get_hod_requests():
 @app.route('/api/hod/approve', methods=['POST'])
 def hod_approve():
     try:
-        data = request.json
-        req_id = data.get('request_id')
-        # Use real ObjectId for lookup
-        req = db.leave_requests.find_one({"_id": ObjectId(req_id)})
+        data    = request.json
+        req_id  = data.get('request_id')
+        req     = db.leave_requests.find_one({'_id': ObjectId(req_id)})
         student_id = req.get('student_id')
-        # Fetch student details for QR
-        student = db.users.find_one({"_id": ObjectId(student_id)})
-        
-        # Construct QR Data
-        student_details = student.get('details', {}) if student else {}
-        name = student.get('name') if student else "Unknown"
-        qr_data = f"APPROVED|{req_id}|{name}"
-        
+        student    = db.users.find_one({'_id': ObjectId(student_id)})
+
+        name     = student.get('name') if student else 'Unknown'
+        qr_data  = f'APPROVED|{req_id}|{name}'
+
         db.leave_requests.update_one(
-            {"_id": ObjectId(req_id)},
-            {"$set": {"status": "approved", "hod_approved": True, "qr_code_data": qr_data}}
+            {'_id': ObjectId(req_id)},
+            {'$set': {'status': 'approved', 'hod_approved': True, 'qr_code_data': qr_data}}
         )
-        return jsonify({"message": "Approved by HOD. QR Code Generated."})
+
+        # Push to student — final approval
+        send_push_to_user(student_id,
+            '✅ Leave Fully Approved!',
+            f'HOD approved your leave. Your digital pass is ready.',
+            {'tag': 'approved', 'url': '/dashboard.html'})
+
+        # Push to parent — inform them
+        try:
+            p_phone = student.get('details', {}).get('parent_phone')
+            if p_phone:
+                parent = db.users.find_one({'phone': p_phone, 'role': 'parent'})
+                if parent:
+                    send_push_to_user(str(parent['_id']),
+                        '✅ Child Leave Approved',
+                        f"{name}'s leave has been fully approved by the HOD.",
+                        {'tag': 'approved', 'url': '/dashboard.html'})
+        except Exception: pass
+
+        return jsonify({'message': 'Approved by HOD. QR Code Generated.'})
     except Exception as e:
-        print(f"HOD Approve Error: {e}")
-        return jsonify({"error": str(e)}), 500
+        print(f'HOD Approve Error: {e}')
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/student/delete_request', methods=['POST'])
 def delete_request():
