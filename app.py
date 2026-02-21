@@ -243,6 +243,51 @@ def send_push_to_role(role: str, title: str, body: str, data: dict = None):
         send_push(t['token'], title, body, data)
 
 
+# ── FCM Token Save Endpoint ───────────────────────────────────────────────────
+@app.route('/api/save-fcm-token', methods=['POST'])
+def save_fcm_token():
+    """Called by ALL apps (student/staff/parent/admin) on login to register device token."""
+    try:
+        data   = request.json
+        token  = data.get('token', '').strip()
+        role   = data.get('role', '').strip()
+        uid    = str(data.get('userId', '')).strip()
+
+        if not token or not uid:
+            return jsonify({'error': 'token and userId are required'}), 400
+
+        # Upsert: one doc per (userId, token) pair — keeps duplicates out
+        existing = db.fcm_tokens.find_one({'userId': uid, 'token': token})
+        if existing:
+            # Refresh the timestamp so we know it's still active
+            db.fcm_tokens.update_one(
+                {'userId': uid, 'token': token},
+                {'$set': {'role': role, 'updated_at': datetime.now()}}
+            )
+            print(f"[FCM] Token refreshed | role={role} | userId={uid}")
+        else:
+            db.fcm_tokens.insert_one({
+                'userId'    : uid,
+                'token'     : token,
+                'role'      : role,
+                'created_at': datetime.now(),
+                'updated_at': datetime.now()
+            })
+            print(f"[FCM] Token saved | role={role} | userId={uid} | token={token[:20]}...")
+
+        return jsonify({'success': True, 'message': 'FCM token registered'})
+
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/admin/fcm_token', methods=['POST'])
+def save_admin_fcm_token():
+    """Admin app uses a slightly different endpoint path — proxies to the same logic."""
+    return save_fcm_token()
+
+
 # --- Helper to serialize MongoDB objects ---
 def serialize_doc(doc):
     if not doc: return None
