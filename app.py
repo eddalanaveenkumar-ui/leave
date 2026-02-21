@@ -150,19 +150,39 @@ def _init_firebase():
     if not _FCM_AVAILABLE or _firebase_initialized:
         return
     try:
-        # Option 1: Use GOOGLE_APPLICATION_CREDENTIALS env var (production)
-        cred_path = os.environ.get('FIREBASE_SERVICE_ACCOUNT_JSON')
-        if cred_path and os.path.exists(cred_path):
-            cred = credentials.Certificate(cred_path)
-        else:
-            # Option 2: Inline service account (fallback for dev — keep this file out of git)
+        cred = None
+
+        # Option 1: Env var contains the full JSON string (Render / production)
+        sa_json_str = os.environ.get('FIREBASE_SERVICE_ACCOUNT_JSON')
+        if sa_json_str:
+            try:
+                sa_dict = json.loads(sa_json_str)
+                cred = credentials.Certificate(sa_dict)
+                print("[FCM] Loaded credentials from FIREBASE_SERVICE_ACCOUNT_JSON env var")
+            except Exception as env_err:
+                print(f"[FCM] Failed to parse env var as JSON: {env_err}")
+
+        # Option 2: Local file (development)
+        if cred is None:
             sa_path = os.path.join(os.path.dirname(__file__), 'firebase-service-account.json')
             if os.path.exists(sa_path):
-                cred = credentials.Certificate(sa_path)
-            else:
-                print("[FCM] No service account found. Push notifications disabled.")
-                print("[FCM] Provide firebase-service-account.json next to app.py.")
-                return
+                try:
+                    with open(sa_path) as f:
+                        sa_dict = json.load(f)
+                    # Skip if it's still the placeholder
+                    if 'YOUR_PRIVATE_KEY' in sa_dict.get('private_key', ''):
+                        print("[FCM] firebase-service-account.json still has placeholder values. Skipping.")
+                    else:
+                        cred = credentials.Certificate(sa_path)
+                        print("[FCM] Loaded credentials from firebase-service-account.json")
+                except Exception as file_err:
+                    print(f"[FCM] Failed to load service account file: {file_err}")
+
+        if cred is None:
+            print("[FCM] No valid Firebase credentials found. Push notifications DISABLED.")
+            print("[FCM] → Set FIREBASE_SERVICE_ACCOUNT_JSON env var on Render with the full JSON content.")
+            return
+
         if not firebase_admin._apps:
             firebase_admin.initialize_app(cred)
         _firebase_initialized = True
