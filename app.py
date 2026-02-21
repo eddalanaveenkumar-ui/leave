@@ -44,16 +44,24 @@ class MockCollection:
                 return None
         return current
 
+    def _matches_value(self, doc_val, query_val):
+        """Match a single field value against a query value (supports $in)."""
+        if isinstance(query_val, dict):
+            if '$in' in query_val:
+                return doc_val in query_val['$in']
+            if '$ne' in query_val:
+                return doc_val != query_val['$ne']
+        return doc_val == query_val
+
     def find_one(self, query):
         for doc in self.data:
             match = True
             for k, v in query.items():
                 if k == '_id' and isinstance(v, ObjectId):
-                     if doc.get('_id') != v: match = False
+                    if doc.get('_id') != v: match = False
                 else:
-                    # Support dot notation
                     val = self._get_nested(doc, k)
-                    if val != v:
+                    if not self._matches_value(val, v):
                         match = False
             if match: return doc
         return None
@@ -63,10 +71,9 @@ class MockCollection:
         for doc in self.data:
             match = True
             for k, v in query.items():
-                if k == '_id': continue 
-                
+                if k == '_id': continue
                 val = self._get_nested(doc, k)
-                if val != v:
+                if not self._matches_value(val, v):
                     match = False
             if match: results.append(doc)
         return ConvertCursor(results)
@@ -404,84 +411,71 @@ def admin_login():
 @app.route('/api/admin/add_user', methods=['POST'])
 def add_user():
     try:
-        data = request.json
-        role = data.get('role')
-        name = data.get('name')
-        phone = data.get('phone')
-        details = data.get('details', {}) 
-        
-        if not role or not phone:
-            return jsonify({"error": "Missing fields"}), 400
+        data    = request.json
+        role    = data.get('role', '').strip()
+        name    = data.get('name', '').strip()
+        phone   = data.get('phone', '').strip()
+        details = data.get('details', {})
 
-        existing = db.users.find_one({"phone": phone, "role": role})
+        if not role or not phone or not name:
+            return jsonify({"error": "Missing required fields (role, name, phone)"}), 400
+
+        # ── Duplicate check ──────────────────────────────────────────────
+        if role == 'student':
+            # Exact match on student role + phone
+            existing = db.users.find_one({"phone": phone, "role": "student"})
+        else:
+            # For any staff role check across ALL staff roles to avoid same phone conflicts
+            existing = db.users.find_one({"phone": phone, "role": {"$in": ["mentor", "hod", "management"]}})
+
         if existing:
-            return jsonify({"error": "User already exists"}), 400
+            return jsonify({"error": f"A user with phone {phone} already exists ({existing.get('name','?')} / {existing.get('role','?')})"}), 400
 
-        # --- VALIDATIONS ---
-        # 1. Parent Phone != Student Phone
+        # ── Role-specific validations ────────────────────────────────────
         if role == 'student':
             p_phone = details.get('parent_phone')
             if p_phone and phone == p_phone:
-                return jsonify({"error": "Student phone cannot be the same as Parent phone"}), 400
+                return jsonify({"error": "Student phone cannot match Parent phone"}), 400
 
-        # 2. One HOD per Department
         if role == 'hod':
-            dept = details.get('dept')
+            dept = details.get('dept', '')
             if dept:
                 existing_hod = db.users.find_one({"role": "hod", "details.dept": dept})
                 if existing_hod:
-                    return jsonify({"error": f"HOD for {dept} already exists ({existing_hod['name']})"}), 400
-        # -------------------
+                    return jsonify({"error": f"HOD for '{dept}' already exists: {existing_hod.get('name','?')}"}), 400
 
-        # --- VALIDATIONS ---
-        # 1. Parent Phone != Student Phone
-        if role == 'student':
-            p_phone = details.get('parent_phone')
-            if p_phone and phone == p_phone:
-                return jsonify({"error": "Student phone cannot be the same as Parent phone"}), 400
-
-        # 2. One HOD per Department
-        if role == 'hod':
-            dept = details.get('dept')
-            if dept:
-                existing_hod = db.users.find_one({"role": "hod", "details.dept": dept})
-                if existing_hod:
-                    return jsonify({"error": f"HOD for {dept} already exists ({existing_hod['name']})"}), 400
-        # -------------------
-            
+        # ── Insert user ─────────────────────────────────────────────────
         new_user = {
-            "role": role,
-            "name": name,
-            "phone": phone,
-            "details": details,
+            "role"      : role,
+            "name"      : name,
+            "phone"     : phone,
+            "details"   : details,
             "created_at": datetime.now()
         }
-        
-        result = db.users.insert_one(new_user)
-        student_id = result.inserted_id
+        result   = db.users.insert_one(new_user)
+        new_id   = result.inserted_id
 
-        # Auto-create Parent Account if Student
+        # ── Auto-create Parent account if student has parent info ──────────
         if role == 'student':
-            p_name = details.get('parent_name')
-            p_phone = details.get('parent_phone')
-            p_image = details.get('parent_profile_image')
-            
+            p_name  = details.get('parent_name', '')
+            p_phone = details.get('parent_phone', '')
+            p_img   = details.get('parent_profile_image', '')
             if p_name and p_phone:
-                existing_parent = db.users.find_one({"phone": p_phone, "role": "parent"})
-                if not existing_parent:
+                if not db.users.find_one({"phone": p_phone, "role": "parent"}):
                     db.users.insert_one({
-                        "role": "parent",
-                        "name": p_name,
-                        "phone": p_phone,
-                        "details": {"children": [str(student_id)], "profile_image": p_image},
+                        "role"      : "parent",
+                        "name"      : p_name,
+                        "phone"     : p_phone,
+                        "details"   : {"children": [str(new_id)], "profile_image": p_img},
                         "created_at": datetime.now()
                     })
-                else:
-                    # Append child if not already there checks/logic could go here
-                    pass
 
-        return jsonify({"message": f"{role.capitalize()} added successfully", "id": str(student_id)})
+        print(f"[add_user] Created {role}: {name} / {phone}")
+        return jsonify({"message": f"{role.capitalize()} '{name}' added successfully", "id": str(new_id)})
+
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/admin/users/<role_type>', methods=['GET'])
