@@ -204,9 +204,17 @@ def send_push(token: str, title: str, body: str, data: dict = None) -> bool:
 
 def send_push_to_user(user_id: str, title: str, body: str, data: dict = None):
     """Send push to ALL devices registered for a userId."""
-    tokens = list(db.fcm_tokens.find({'userId': user_id}))
+    uid = str(user_id)  # normalise to string
+    # Query by both exact userId AND string version (covers ObjectId stored as str)
+    tokens = list(db.fcm_tokens.find({'userId': uid}))
+    print(f"[FCM] send_push_to_user | userId={uid} | tokens_found={len(tokens)}")
+    sent = 0
     for t in tokens:
-        send_push(t['token'], title, body, data)
+        if send_push(t['token'], title, body, data):
+            sent += 1
+    if sent == 0:
+        print(f"[FCM] WARNING: No notifications sent for userId={uid}. Is the FCM token saved?")
+    return sent
 
 def send_push_to_role(role: str, title: str, body: str, data: dict = None):
     """Broadcast push to all devices of users with a given role."""
