@@ -753,12 +753,33 @@ def hod_approve():
         student_id = req.get('student_id')
         student    = db.users.find_one({'_id': ObjectId(student_id)})
 
-        name     = student.get('name') if student else 'Unknown'
-        qr_data  = f'APPROVED|{req_id}|{name}'
+        name    = student.get('name', 'Unknown') if student else 'Unknown'
+        details = student.get('details', {}) if student else {}
+
+        # ── Rich JSON QR payload so scanner can validate offline too ───────
+        approved_at = datetime.now().isoformat()
+        qr_payload = {
+            'request_id'  : req_id,
+            'student_name': name,
+            'department'  : details.get('dept', ''),
+            'year'        : details.get('year', ''),
+            'reason'      : req.get('reason', ''),
+            'start_date'  : req.get('start_date', ''),
+            'end_date'    : req.get('end_date', ''),
+            'status'      : 'approved',
+            'hod_approved': True,
+            'approved_at' : approved_at
+        }
+        qr_data = json.dumps(qr_payload)
 
         db.leave_requests.update_one(
             {'_id': ObjectId(req_id)},
-            {'$set': {'status': 'approved', 'hod_approved': True, 'qr_code_data': qr_data}}
+            {'$set': {
+                'status'      : 'approved',
+                'hod_approved': True,
+                'qr_code_data': qr_data,
+                'approved_at' : approved_at
+            }}
         )
 
         # Push to student — final approval
@@ -783,6 +804,110 @@ def hod_approve():
     except Exception as e:
         print(f'HOD Approve Error: {e}')
         return jsonify({'error': str(e)}), 500
+
+@app.route('/api/validate_pass', methods=['POST'])
+def validate_pass():
+    """Called by Staff scanner — validates a scanned QR code payload."""
+    try:
+        data     = request.json
+        raw_data = data.get('qr_data', '')
+
+        # ── Try to parse JSON QR payload ─────────────────────────────────
+        try:
+            payload = json.loads(raw_data)
+        except Exception:
+            # Old pipe-delimited format: APPROVED|req_id|name
+            parts = raw_data.split('|')
+            if len(parts) == 3 and parts[0] == 'APPROVED':
+                payload = {'request_id': parts[1], 'student_name': parts[2], 'status': 'approved'}
+            else:
+                return jsonify({
+                    'valid'  : False,
+                    'allowed': False,
+                    'message': 'Unrecognized QR code format'
+                }), 200
+
+        req_id = payload.get('request_id')
+        if not req_id:
+            return jsonify({'valid': False, 'allowed': False, 'message': 'QR missing request ID'}), 200
+
+        # ── Fetch live record from DB ─────────────────────────────────────
+        try:
+            req = db.leave_requests.find_one({'_id': ObjectId(req_id)})
+        except Exception:
+            req = None
+
+        if not req:
+            # Fallback: trust the QR payload itself (offline scenario)
+            req = payload
+
+        status      = req.get('status', '').lower()
+        hod_ok      = req.get('hod_approved', False) or status == 'approved'
+        start_date  = req.get('start_date', '')
+        end_date    = req.get('end_date', '')
+        approved_at = req.get('approved_at', payload.get('approved_at', ''))
+
+        # ── Fetch fresh student info ──────────────────────────────────────
+        student_name = payload.get('student_name', 'Unknown')
+        department   = payload.get('department', '')
+        year         = payload.get('year', '')
+        reason       = payload.get('reason', req.get('reason', ''))
+
+        try:
+            sid     = req.get('student_id')
+            student = db.users.find_one({'_id': ObjectId(sid)}) if sid else None
+            if student:
+                student_name = student.get('name', student_name)
+                det          = student.get('details', {})
+                department   = det.get('dept', department)
+                year         = det.get('year', year)
+        except Exception:
+            pass
+
+        # ── Date / expiry checks ──────────────────────────────────────────
+        now = datetime.now()
+        try:
+            s = datetime.strptime(start_date, '%Y-%m-%d') if start_date else None
+            e = datetime.strptime(end_date,   '%Y-%m-%d') if end_date   else None
+            within_range = (s is None or now.date() >= s.date()) and \
+                           (e is None or now.date() <= e.date())
+        except Exception:
+            within_range = True
+
+        not_expired = True
+        if approved_at:
+            try:
+                at = datetime.fromisoformat(approved_at)
+                not_expired = (now - at).total_seconds() <= 86400  # 24 h
+            except Exception:
+                not_expired = True
+
+        base_info = {
+            'student_name': student_name,
+            'department'  : department,
+            'year'        : year,
+            'reason'      : reason,
+            'start_date'  : start_date,
+            'end_date'    : end_date,
+        }
+
+        if not hod_ok:
+            return jsonify({**base_info, 'valid': False, 'allowed': False,
+                            'message': 'Leave not fully approved by HOD'})
+        if not within_range:
+            return jsonify({**base_info, 'valid': False, 'allowed': False,
+                            'expired': True, 'message': 'Leave period has ended'})
+        if not not_expired:
+            return jsonify({**base_info, 'valid': False, 'allowed': False,
+                            'expired': True, 'message': 'Pass expired (> 24 hours since approval)'})
+
+        return jsonify({**base_info, 'valid': True, 'allowed': True,
+                        'message': 'Valid approved leave pass ✅'})
+
+    except Exception as e:
+        print(f'[validate_pass] Error: {e}')
+        return jsonify({'valid': False, 'allowed': False, 'message': f'Server error: {e}'}), 500
+
 
 @app.route('/api/student/delete_request', methods=['POST'])
 def delete_request():
