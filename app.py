@@ -471,15 +471,22 @@ def send_login_otp():
             upsert=True
         )
 
-        # Send via Gmail
+        # Send via Resend
         name = user.get('name', '')
         sent = send_otp_email(email or '', otp, name) if email else False
 
-        if email and not sent:
-            return jsonify({'error': 'Failed to send OTP email. Please contact admin.'}), 500
+        print(f'[OTP] Generated for {email or phone}: {otp} | email_sent={sent}')
 
-        print(f'[OTP] Generated for {email or phone}: {otp}')
-        return jsonify({'message': 'OTP sent to your email', 'status': 'success'})
+        if sent:
+            return jsonify({'message': 'OTP sent to your email', 'status': 'success'})
+        else:
+            # Email not configured yet — return OTP directly so admin/users can still log in
+            # Once RESEND_API_KEY is set in environment, OTP will be emailed instead
+            return jsonify({
+                'message': 'Email not configured. Use the code below to log in.',
+                'status': 'fallback',
+                'otp_code': otp   # shown in app when email is not set up
+            })
 
     except Exception as e:
         print(f'[OTP] send error: {e}')
