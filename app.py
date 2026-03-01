@@ -9,9 +9,8 @@ import threading
 import time
 import string
 import json
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+import urllib.request
+import urllib.error
 
 # ── Firebase Admin SDK (for sending push notifications) ──────────────────────
 try:
@@ -381,42 +380,55 @@ def broadcast_notification():
 
 # --- Login Endpoints ---
 
-# ── Gmail OTP Helpers ────────────────────────────────────────────────────────
-GMAIL_USER = os.environ.get('GMAIL_USER', '')
-GMAIL_APP_PASSWORD = os.environ.get('GMAIL_APP_PASSWORD', '')
+# ── Resend Email OTP Helpers ─────────────────────────────────────────────────────
+RESEND_API_KEY = os.environ.get('RESEND_API_KEY', '')
 
 def send_otp_email(to_email: str, otp: str, name: str = '') -> bool:
-    """Send a 6-digit OTP to the user's email via Gmail SMTP."""
+    """Send a 6-digit OTP via Resend HTTP API (works on Render free tier)."""
     try:
-        if not GMAIL_USER or not GMAIL_APP_PASSWORD:
-            print('[OTP] Gmail credentials not set in environment variables.')
+        if not RESEND_API_KEY:
+            print('[OTP] RESEND_API_KEY not set. Cannot send email.')
             return False
-
-        msg = MIMEMultipart('alternative')
-        msg['Subject'] = f'{otp} is your LeaveSync login code'
-        msg['From']    = f'LeaveSync <{GMAIL_USER}>'
-        msg['To']      = to_email
 
         html = f"""
         <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#f9fafb;border-radius:12px;">
           <h2 style="color:#1E40AF;margin-bottom:8px;">LeaveSync</h2>
           <p style="color:#374151;font-size:15px;">Hello{' ' + name if name else ''},</p>
-          <p style="color:#374151;font-size:15px;">Use this code to log in to your LeaveSync account:</p>
-          <div style="background:#1E40AF;color:white;font-size:36px;font-weight:bold;letter-spacing:10px;text-align:center;padding:20px 32px;border-radius:10px;margin:24px 0;">{otp}</div>
-          <p style="color:#6B7280;font-size:13px;">This code expires in <strong>10 minutes</strong>. Do not share it with anyone.</p>
-          <hr style="border:none;border-top:1px solid #E5E7EB;margin:24px 0;">
-          <p style="color:#9CA3AF;font-size:12px;">If you did not request this, ignore this email.</p>
+          <p style="color:#374151;font-size:15px;">Your login code for LeaveSync:</p>
+          <div style="background:#1E40AF;color:white;font-size:36px;font-weight:bold;letter-spacing:10px;
+                      text-align:center;padding:20px 32px;border-radius:10px;margin:24px 0;">{otp}</div>
+          <p style="color:#6B7280;font-size:13px;">Expires in <strong>10 minutes</strong>. Do not share this code.</p>
+          <p style="color:#9CA3AF;font-size:12px;">If you didn't request this, ignore this email.</p>
         </div>
         """
-        msg.attach(MIMEText(html, 'html'))
 
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
-            server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-            server.sendmail(GMAIL_USER, to_email, msg.as_string())
-        print(f'[OTP] Email sent to {to_email}')
-        return True
+        payload = json.dumps({
+            'from': 'LeaveSync <onboarding@resend.dev>',
+            'to':   [to_email],
+            'subject': f'{otp} – Your LeaveSync Login Code',
+            'html': html
+        }).encode('utf-8')
+
+        req = urllib.request.Request(
+            'https://api.resend.com/emails',
+            data=payload,
+            headers={
+                'Authorization': f'Bearer {RESEND_API_KEY}',
+                'Content-Type':  'application/json'
+            },
+            method='POST'
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            status = resp.status
+        print(f'[OTP] Resend response: {status} for {to_email}')
+        return status in (200, 201)
+
+    except urllib.error.HTTPError as e:
+        body = e.read().decode('utf-8', errors='replace')
+        print(f'[OTP] Resend HTTP error {e.code}: {body}')
+        return False
     except Exception as e:
-        print(f'[OTP] Failed to send email: {e}')
+        print(f'[OTP] send_otp_email error: {e}')
         return False
 
 
