@@ -327,6 +327,21 @@ if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
 
 # --- API Endpoints ---
 
+@app.route('/api/test-email', methods=['GET', 'POST'])
+def test_email():
+    """Diagnostic: test EmailJS config and send a test OTP email."""
+    to = request.args.get('to') or (request.json or {}).get('to', '')
+    config_status = {
+        'EMAILJS_SERVICE_ID':  bool(EMAILJS_SERVICE_ID),
+        'EMAILJS_TEMPLATE_ID': bool(EMAILJS_TEMPLATE_ID),
+        'EMAILJS_PUBLIC_KEY':  bool(EMAILJS_PUBLIC_KEY),
+        'EMAILJS_PRIVATE_KEY': bool(EMAILJS_PRIVATE_KEY),
+    }
+    if not to:
+        return jsonify({'config': config_status, 'note': 'Add ?to=youremail@gmail.com to send a test'})
+    sent = send_otp_email(to, '123456', 'Test User')
+    return jsonify({'config': config_status, 'sent': sent, 'to': to})
+
 
 @app.route('/api/send-notification', methods=['POST'])
 def send_notification():
