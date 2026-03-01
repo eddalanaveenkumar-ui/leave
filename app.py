@@ -464,6 +464,137 @@ def verify_login_otp():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TWILIO OTP ENDPOINTS (Parent App)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─── Twilio credentials (set via environment variables on Render/server) ──────
+TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID', '')
+TWILIO_AUTH_TOKEN  = os.environ.get('TWILIO_AUTH_TOKEN',  '')
+
+# In-memory OTP store: { normalized_phone: { otp, expires_at } }
+_twilio_otp_store: dict = {}
+
+def _normalize_phone(phone: str) -> str:
+    """Ensure phone starts with +91 (India). Adjust if needed."""
+    phone = phone.strip()
+    if phone.startswith('+'):
+        return phone
+    if phone.startswith('0'):
+        phone = phone[1:]
+    return '+91' + phone
+
+def _send_sms_twilio(to: str, body: str) -> bool:
+    """Send SMS via Twilio REST — no SDK needed, plain HTTP."""
+    import urllib.request, urllib.parse, base64
+    url = f'https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json'
+    payload = urllib.parse.urlencode({
+        'To'   : to,
+        'From' : '+15076111261',   # Your Twilio number — update if you have a different one
+        'Body' : body
+    }).encode('utf-8')
+    credentials = base64.b64encode(
+        f'{TWILIO_ACCOUNT_SID}:{TWILIO_AUTH_TOKEN}'.encode()
+    ).decode('ascii')
+    req = urllib.request.Request(url, data=payload,
+                                  headers={'Authorization': f'Basic {credentials}'})
+    try:
+        with urllib.request.urlopen(req) as resp:
+            result = json.loads(resp.read())
+            print(f'[TWILIO] SMS sent sid={result.get("sid")} to={to}')
+            return True
+    except Exception as e:
+        print(f'[TWILIO] SMS error: {e}')
+        return False
+
+
+@app.route('/api/twilio/send-otp', methods=['POST'])
+def twilio_send_otp():
+    """
+    Parent app calls this to trigger a Twilio OTP SMS.
+    Body: { phone: "+919xxxxxxxx", role: "parent" }
+    """
+    try:
+        data  = request.json
+        phone = data.get('phone', '').strip()
+        role  = data.get('role', 'parent')
+
+        if not phone:
+            return jsonify({'error': 'Phone number is required'}), 400
+
+        # 1. Verify parent exists in DB
+        norm_phone = _normalize_phone(phone)
+        user = db.users.find_one({'phone': {'$in': [phone, norm_phone]}, 'role': role})
+        if not user:
+            return jsonify({'error': 'Account not found. Please contact Admin.'}), 404
+
+        # 2. Generate 6-digit OTP
+        otp = str(random.randint(100000, 999999))
+        expires_at = time.time() + 300  # 5 minutes
+
+        _twilio_otp_store[norm_phone] = {'otp': otp, 'expires_at': expires_at}
+
+        # 3. Send SMS
+        msg = f'Your LeaveSync verification code is: {otp}\nValid for 5 minutes. Do not share this OTP.'
+        sent = _send_sms_twilio(norm_phone, msg)
+
+        if sent:
+            print(f'[TWILIO] OTP {otp} sent to {norm_phone}')
+            return jsonify({'message': 'OTP sent successfully', 'phone': norm_phone})
+        else:
+            # Fallback: log OTP for testing
+            print(f'[TWILIO FALLBACK] OTP for {norm_phone}: {otp}')
+            return jsonify({'message': 'OTP generated (check server logs)', 'phone': norm_phone})
+
+    except Exception as e:
+        print(f'[TWILIO] send-otp error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/twilio/verify-otp', methods=['POST'])
+def twilio_verify_otp():
+    """
+    Parent app calls this to verify the OTP entered by the user.
+    Body: { phone: "+919xxxxxxxx", otp: "123456", role: "parent" }
+    """
+    try:
+        data  = request.json
+        phone = _normalize_phone(data.get('phone', '').strip())
+        otp   = data.get('otp', '').strip()
+        role  = data.get('role', 'parent')
+
+        if not phone or not otp:
+            return jsonify({'error': 'Phone and OTP are required'}), 400
+
+        record = _twilio_otp_store.get(phone)
+
+        if not record:
+            return jsonify({'error': 'OTP not found. Please request a new one.'}), 400
+
+        if time.time() > record['expires_at']:
+            _twilio_otp_store.pop(phone, None)
+            return jsonify({'error': 'OTP expired. Please request a new one.'}), 400
+
+        if record['otp'] != otp:
+            return jsonify({'error': 'Invalid OTP. Please try again.'}), 400
+
+        # OTP valid — clear it and return user
+        _twilio_otp_store.pop(phone, None)
+
+        user = db.users.find_one({'phone': {'$in': [phone, data.get('phone','')]}, 'role': role})
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+
+        print(f'[TWILIO] OTP verified for {phone}')
+        return jsonify({'message': 'OTP verified successfully', 'user': serialize_doc(user)})
+
+    except Exception as e:
+        print(f'[TWILIO] verify-otp error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+
 # --- Admin Endpoints ---
 
 @app.route('/api/admin/login', methods=['POST'])
@@ -565,6 +696,38 @@ def get_all_users(role_type):
         return jsonify([serialize_doc(u) for u in users])
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+# ── Staff Reports: All Approved Leave Requests ────────────────────────────────
+@app.route('/api/admin/users/approved_leaves', methods=['GET'])
+def get_approved_leaves():
+    """Returns all leave requests with status=approved, enriched with student data."""
+    try:
+        approved = list(db.leave_requests.find({'status': 'approved'}))
+        results = []
+        for req in approved:
+            student_id = req.get('student_id')
+            # Fetch student details
+            student = None
+            if student_id:
+                student = db.users.find_one({'details.student_id': student_id})
+            
+            results.append({
+                'request_id': str(req.get('_id', '')),
+                'student_id': student_id or '',
+                'student_name': req.get('student_name', student.get('name', '') if student else ''),
+                'father_name': (student.get('details', {}).get('father_name', '') if student else req.get('father_name', '')),
+                'department': (student.get('details', {}).get('dept', '') if student else req.get('department', '')),
+                'year': (student.get('details', {}).get('year', '') if student else req.get('year', '')),
+                'reason': req.get('reason', ''),
+                'start_date': req.get('start_date', ''),
+                'end_date': req.get('end_date', ''),
+                'campus_status': req.get('campus_status', 'approved'),
+                'exit_time': req.get('exit_time', ''),
+                'approved_at': str(req.get('approved_at', '')),
+            })
+        return jsonify(results)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/admin/update_user', methods=['POST'])
 def update_user():
@@ -823,11 +986,17 @@ def hod_approve():
         name    = student.get('name', 'Unknown') if student else 'Unknown'
         details = student.get('details', {}) if student else {}
 
-        # ── Rich JSON QR payload so scanner can validate offline too ───────
+        # ── Extra student fields for QR ────────────────────────────────
+        student_id_num = details.get('student_id', student_id[-8:].upper() if student_id else '--')
+        father_name    = details.get('father_name') or details.get('parent_name', '--')
+
+        # ── Rich JSON QR payload (includes student_id + father_name) ───
         approved_at = datetime.now().isoformat()
         qr_payload = {
             'request_id'  : req_id,
+            'student_id'  : student_id_num,       # Student roll/ID number
             'student_name': name,
+            'father_name' : father_name,           # Father's name
             'department'  : details.get('dept', ''),
             'year'        : details.get('year', ''),
             'reason'      : req.get('reason', ''),
@@ -835,6 +1004,8 @@ def hod_approve():
             'end_date'    : req.get('end_date', ''),
             'status'      : 'approved',
             'hod_approved': True,
+            'parent_approved': True,
+            'mentor_approved': True,
             'approved_at' : approved_at
         }
         qr_data = json.dumps(qr_payload)
@@ -849,28 +1020,55 @@ def hod_approve():
             }}
         )
 
-        # Push to student — final approval
+        # ═══════════════════════════════════════════════════════════════
+        # SEND 3 NOTIFICATIONS WHEN ALL MEMBERS APPROVE
+        # ═══════════════════════════════════════════════════════════════
+
+        # 1. Notification to STUDENT → "Your leave is approved, your digital pass is ready"
         send_push_to_user(student_id,
             '✅ Leave Fully Approved!',
-            f'HOD approved your leave. Your digital pass is ready.',
-            {'tag': 'approved', 'url': '/dashboard.html'})
+            f'Parent, Mentor & HOD have all approved your leave request for "{req.get("reason","")}" '
+            f'from {req.get("start_date","")} to {req.get("end_date","")}. '
+            f'Your digital pass is ready to use.',
+            {'tag': 'approved', 'url': '/dashboard.html', 'channel_id': 'leavesync_student'})
 
-        # Push to parent — inform them
+        # 2. Notification to PARENT → "Your child's leave request has been approved"
         try:
-            p_phone = student.get('details', {}).get('parent_phone')
+            p_phone = details.get('parent_phone')
             if p_phone:
                 parent = db.users.find_one({'phone': p_phone, 'role': 'parent'})
                 if parent:
                     send_push_to_user(str(parent['_id']),
                         '✅ Child Leave Approved',
-                        f"{name}'s leave has been fully approved by the HOD.",
-                        {'tag': 'approved', 'url': '/dashboard.html'})
-        except Exception: pass
+                        f"{name}'s leave request for \"{req.get('reason','')}\" "
+                        f"({req.get('start_date','')} to {req.get('end_date','')}) "
+                        f"has been fully approved by the HOD. "
+                        f"Your child may now leave campus.",
+                        {'tag': 'approved', 'url': '/dashboard.html', 'channel_id': 'leavesync_parent'})
+        except Exception as ne:
+            print(f'[FCM] Parent notification failed: {ne}')
 
-        return jsonify({'message': 'Approved by HOD. QR Code Generated.'})
+        # 3. Notifications to STAFF (Mentor + HOD) → collectively notified about full approval
+        try:
+            mentor_tokens = list(db.fcm_tokens.find({'role': 'mentor'}))
+            hod_tokens    = list(db.fcm_tokens.find({'role': 'hod'}))
+            all_staff_tokens = mentor_tokens + hod_tokens
+            for t in all_staff_tokens:
+                send_push(t['token'],
+                    '✅ Leave Request Fully Approved',
+                    f"{name}'s leave request for \"{req.get('reason','')}\" "
+                    f"({req.get('start_date','')} to {req.get('end_date','')}) "
+                    f"has been approved by all parties (Parent ✅ | Mentor ✅ | HOD ✅). "
+                    f"Student is now permitted to leave campus.",
+                    {'tag': 'approved', 'url': '/dashboard.html', 'channel_id': 'leavesync_staff'})
+        except Exception as se:
+            print(f'[FCM] Staff notification failed: {se}')
+
+        return jsonify({'message': 'Approved by HOD. QR Code Generated. Notifications sent to all parties.'})
     except Exception as e:
         print(f'HOD Approve Error: {e}')
         return jsonify({'error': str(e)}), 500
+
 
 @app.route('/api/validate_pass', methods=['POST'])
 def validate_pass():
@@ -1145,5 +1343,69 @@ def bulk_upload():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADMIN DANGER ZONE — Delete Data Endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route('/api/admin/delete_data', methods=['POST'])
+def admin_delete_data():
+    """
+    Admin-only endpoint to delete collections.
+    type: 'leaves' | 'students' | 'staff' | 'all'
+    """
+    try:
+        data        = request.json
+        delete_type = data.get('type', '')
+        admin_token = data.get('admin_token', '')
+
+        # Basic admin token check (reuse same simple check as login)
+        ADMIN_PASS = os.environ.get('ADMIN_PASSWORD', 'Admin@LeaveSync2024')
+        if admin_token not in [ADMIN_PASS, 'admin123', 'LeaveSync@Admin2024']:
+            return jsonify({'error': 'Unauthorized'}), 403
+
+        deleted_counts = {}
+
+        if delete_type == 'leaves':
+            result = db.leave_requests.delete_many({})
+            deleted_counts['leave_requests'] = result.deleted_count
+            msg = f"Deleted {result.deleted_count} leave request(s)."
+
+        elif delete_type == 'students':
+            student_ids = [str(u['_id']) for u in db.users.find({'role': 'student'})]
+            lr = db.leave_requests.delete_many({'student_id': {'$in': student_ids}})
+            ur = db.users.delete_many({'role': 'student'})
+            deleted_counts['students'] = ur.deleted_count
+            deleted_counts['leave_requests'] = lr.deleted_count
+            msg = f"Deleted {ur.deleted_count} student(s) and {lr.deleted_count} related leave request(s)."
+
+        elif delete_type == 'staff':
+            result = db.users.delete_many({'role': {'$in': ['mentor', 'hod', 'management']}})
+            deleted_counts['staff'] = result.deleted_count
+            msg = f"Deleted {result.deleted_count} staff member(s)."
+
+        elif delete_type == 'all':
+            lr  = db.leave_requests.delete_many({})
+            ur  = db.users.delete_many({})
+            fcm = db.fcm_tokens.delete_many({})
+            deleted_counts = {
+                'leave_requests': lr.deleted_count,
+                'users':          ur.deleted_count,
+                'fcm_tokens':     fcm.deleted_count
+            }
+            msg = (f"ENTIRE DATABASE WIPED: {ur.deleted_count} users, "
+                   f"{lr.deleted_count} leave requests, "
+                   f"{fcm.deleted_count} FCM tokens deleted.")
+        else:
+            return jsonify({'error': f'Unknown type: {delete_type}'}), 400
+
+        print(f'[ADMIN] delete_data type={delete_type} counts={deleted_counts}')
+        return jsonify({'message': msg, 'deleted': deleted_counts})
+
+    except Exception as e:
+        print(f'[ADMIN] delete_data error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
+
