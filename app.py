@@ -380,56 +380,54 @@ def broadcast_notification():
 
 # --- Login Endpoints ---
 
-# ── Resend Email OTP Helpers ─────────────────────────────────────────────────────
-RESEND_API_KEY = os.environ.get('RESEND_API_KEY', '')
+# ── EmailJS OTP Helpers ──────────────────────────────────────────────────────
+# EmailJS: free 200 emails/month, no domain needed — just connect Gmail
+EMAILJS_SERVICE_ID  = os.environ.get('EMAILJS_SERVICE_ID',  '')
+EMAILJS_TEMPLATE_ID = os.environ.get('EMAILJS_TEMPLATE_ID', '')
+EMAILJS_PUBLIC_KEY  = os.environ.get('EMAILJS_PUBLIC_KEY',  '')
+EMAILJS_PRIVATE_KEY = os.environ.get('EMAILJS_PRIVATE_KEY', '')
 
 def send_otp_email(to_email: str, otp: str, name: str = '') -> bool:
-    """Send a 6-digit OTP via Resend HTTP API (works on Render free tier)."""
+    """Send a 6-digit OTP via EmailJS HTTP API (free, no domain verification needed)."""
     try:
-        if not RESEND_API_KEY:
-            print('[OTP] RESEND_API_KEY not set. Cannot send email.')
+        if not all([EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, EMAILJS_PUBLIC_KEY, EMAILJS_PRIVATE_KEY]):
+            print('[OTP] EmailJS credentials not set. Falling back to on-screen OTP.')
             return False
 
-        html = f"""
-        <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#f9fafb;border-radius:12px;">
-          <h2 style="color:#1E40AF;margin-bottom:8px;">LeaveSync</h2>
-          <p style="color:#374151;font-size:15px;">Hello{' ' + name if name else ''},</p>
-          <p style="color:#374151;font-size:15px;">Your login code for LeaveSync:</p>
-          <div style="background:#1E40AF;color:white;font-size:36px;font-weight:bold;letter-spacing:10px;
-                      text-align:center;padding:20px 32px;border-radius:10px;margin:24px 0;">{otp}</div>
-          <p style="color:#6B7280;font-size:13px;">Expires in <strong>10 minutes</strong>. Do not share this code.</p>
-          <p style="color:#9CA3AF;font-size:12px;">If you didn't request this, ignore this email.</p>
-        </div>
-        """
-
         payload = json.dumps({
-            'from': 'LeaveSync <onboarding@resend.dev>',
-            'to':   [to_email],
-            'subject': f'{otp} – Your LeaveSync Login Code',
-            'html': html
+            'service_id':   EMAILJS_SERVICE_ID,
+            'template_id':  EMAILJS_TEMPLATE_ID,
+            'user_id':      EMAILJS_PUBLIC_KEY,
+            'accessToken':  EMAILJS_PRIVATE_KEY,
+            'template_params': {
+                'to_email':  to_email,
+                'otp_code':  otp,
+                'user_name': name or to_email.split('@')[0],
+            }
         }).encode('utf-8')
 
         req = urllib.request.Request(
-            'https://api.resend.com/emails',
+            'https://api.emailjs.com/api/v1.0/email/send',
             data=payload,
             headers={
-                'Authorization': f'Bearer {RESEND_API_KEY}',
-                'Content-Type':  'application/json'
+                'Content-Type': 'application/json',
+                'Origin': 'https://leave-jgu0.onrender.com'
             },
             method='POST'
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
             status = resp.status
-        print(f'[OTP] Resend response: {status} for {to_email}')
-        return status in (200, 201)
+        print(f'[OTP] EmailJS response: {status} → {to_email}')
+        return status == 200
 
     except urllib.error.HTTPError as e:
         body = e.read().decode('utf-8', errors='replace')
-        print(f'[OTP] Resend HTTP error {e.code}: {body}')
+        print(f'[OTP] EmailJS HTTP error {e.code}: {body}')
         return False
     except Exception as e:
         print(f'[OTP] send_otp_email error: {e}')
         return False
+
 
 
 @app.route('/api/login/otp', methods=['POST'])
