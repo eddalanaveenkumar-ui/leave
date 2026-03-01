@@ -330,7 +330,8 @@ if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
 @app.route('/api/test-email', methods=['GET', 'POST'])
 def test_email():
     """Diagnostic: test EmailJS config and send a test OTP email."""
-    to = request.args.get('to') or (request.json or {}).get('to', '')
+    body = request.get_json(silent=True) or {}
+    to = request.args.get('to') or body.get('to', '')
     config_status = {
         'EMAILJS_SERVICE_ID':  bool(EMAILJS_SERVICE_ID),
         'EMAILJS_TEMPLATE_ID': bool(EMAILJS_TEMPLATE_ID),
