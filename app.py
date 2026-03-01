@@ -383,24 +383,31 @@ def send_login_otp():
     try:
         data = request.json
         phone = data.get('phone')
+        email = data.get('email')
         role = data.get('role', 'student') 
         
-        if not phone:
-            return jsonify({"error": "Phone number required"}), 400
+        if not phone and not email:
+            return jsonify({"error": "Phone number or email required"}), 400
 
-        # DUMMY OTP FOR TESTING
-        otp = "123456" 
+        # Build query depending on what's provided
+        query = {"role": role}
+        if email:
+            query["email"] = email
+        else:
+            query["phone"] = phone
         
-        user = db.users.find_one({"phone": phone, "role": role})
+        user = db.users.find_one(query)
         if not user:
             # Check if they are a student trying to login as something else
+            fallback_q = {"email": email} if email else {"phone": phone}
+            fallback_q["role"] = "student"
             if role in ['management', 'parent', 'mentor', 'hod']:
-                 student_check = db.users.find_one({"phone": phone, "role": "student"})
+                 student_check = db.users.find_one(fallback_q)
                  if student_check:
                       return jsonify({"error": "You are a Student. Please login via Student Portal."}), 403
             return jsonify({"error": "Account not found. Please contact Admin."}), 404
         
-        # User exists, proceed to Firebase
+        # User exists, proceed
         return jsonify({"message": "User verified", "status": "success"})
     except Exception as e:
         print(f"Login Error: {e}")
@@ -411,9 +418,16 @@ def verify_login_otp():
     try:
         data = request.json
         phone = data.get('phone')
+        email = data.get('email')
         role = data.get('role', 'student') 
         
-        user = db.users.find_one({"phone": phone, "role": role})
+        query = {"role": role}
+        if email:
+            query["email"] = email
+        else:
+            query["phone"] = phone
+            
+        user = db.users.find_one(query)
         
         if user:
             return jsonify({"message": "Login successful", "user": serialize_doc(user)})
@@ -577,6 +591,7 @@ def add_user():
         role    = data.get('role', '').strip()
         name    = data.get('name', '').strip()
         phone   = data.get('phone', '').strip()
+        email   = data.get('email', '').strip()
         details = data.get('details', {})
 
         if not role or not phone or not name:
@@ -611,6 +626,7 @@ def add_user():
             "role"      : role,
             "name"      : name,
             "phone"     : phone,
+            "email"     : email,
             "details"   : details,
             "created_at": datetime.now()
         }
