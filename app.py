@@ -2,13 +2,16 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from pymongo import MongoClient
 from bson.objectid import ObjectId
-from datetime import datetime
+from datetime import datetime, timedelta
 import random
 import os
 import threading
 import time
 import string
 import json
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 # ── Firebase Admin SDK (for sending push notifications) ──────────────────────
 try:
@@ -378,63 +381,138 @@ def broadcast_notification():
 
 # --- Login Endpoints ---
 
+# ── Gmail OTP Helpers ────────────────────────────────────────────────────────
+GMAIL_USER = os.environ.get('GMAIL_USER', '')
+GMAIL_APP_PASSWORD = os.environ.get('GMAIL_APP_PASSWORD', '')
+
+def send_otp_email(to_email: str, otp: str, name: str = '') -> bool:
+    """Send a 6-digit OTP to the user's email via Gmail SMTP."""
+    try:
+        if not GMAIL_USER or not GMAIL_APP_PASSWORD:
+            print('[OTP] Gmail credentials not set in environment variables.')
+            return False
+
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = f'{otp} is your LeaveSync login code'
+        msg['From']    = f'LeaveSync <{GMAIL_USER}>'
+        msg['To']      = to_email
+
+        html = f"""
+        <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#f9fafb;border-radius:12px;">
+          <h2 style="color:#1E40AF;margin-bottom:8px;">LeaveSync</h2>
+          <p style="color:#374151;font-size:15px;">Hello{' ' + name if name else ''},</p>
+          <p style="color:#374151;font-size:15px;">Use this code to log in to your LeaveSync account:</p>
+          <div style="background:#1E40AF;color:white;font-size:36px;font-weight:bold;letter-spacing:10px;text-align:center;padding:20px 32px;border-radius:10px;margin:24px 0;">{otp}</div>
+          <p style="color:#6B7280;font-size:13px;">This code expires in <strong>10 minutes</strong>. Do not share it with anyone.</p>
+          <hr style="border:none;border-top:1px solid #E5E7EB;margin:24px 0;">
+          <p style="color:#9CA3AF;font-size:12px;">If you did not request this, ignore this email.</p>
+        </div>
+        """
+        msg.attach(MIMEText(html, 'html'))
+
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+            server.sendmail(GMAIL_USER, to_email, msg.as_string())
+        print(f'[OTP] Email sent to {to_email}')
+        return True
+    except Exception as e:
+        print(f'[OTP] Failed to send email: {e}')
+        return False
+
+
 @app.route('/api/login/otp', methods=['POST'])
 def send_login_otp():
     try:
-        data = request.json
+        data  = request.json
         phone = data.get('phone')
         email = data.get('email')
-        role = data.get('role', 'student') 
-        
+        role  = data.get('role', 'student')
+
         if not phone and not email:
-            return jsonify({"error": "Phone number or email required"}), 400
+            return jsonify({'error': 'Phone number or email required'}), 400
 
         # Build query depending on what's provided
-        query = {"role": role}
+        query = {'role': role}
         if email:
-            query["email"] = email
+            query['email'] = email
         else:
-            query["phone"] = phone
-        
+            query['phone'] = phone
+
         user = db.users.find_one(query)
         if not user:
-            # Check if they are a student trying to login as something else
-            fallback_q = {"email": email} if email else {"phone": phone}
-            fallback_q["role"] = "student"
+            fallback_q = {'email': email} if email else {'phone': phone}
+            fallback_q['role'] = 'student'
             if role in ['management', 'parent', 'mentor', 'hod']:
-                 student_check = db.users.find_one(fallback_q)
-                 if student_check:
-                      return jsonify({"error": "You are a Student. Please login via Student Portal."}), 403
-            return jsonify({"error": "Account not found. Please contact Admin."}), 404
-        
-        # User exists, proceed
-        return jsonify({"message": "User verified", "status": "success"})
+                student_check = db.users.find_one(fallback_q)
+                if student_check:
+                    return jsonify({'error': 'You are a Student. Please login via Student Portal.'}), 403
+            return jsonify({'error': 'Account not found. Please contact Admin.'}), 404
+
+        # Generate 6-digit OTP
+        otp = str(random.randint(100000, 999999))
+        expires_at = datetime.utcnow() + timedelta(minutes=10)
+
+        # Store OTP in DB (upsert per email)
+        db.otps.update_one(
+            {'email': email or phone},
+            {'$set': {'otp': otp, 'expires_at': expires_at, 'role': role}},
+            upsert=True
+        )
+
+        # Send via Gmail
+        name = user.get('name', '')
+        sent = send_otp_email(email or '', otp, name) if email else False
+
+        if email and not sent:
+            return jsonify({'error': 'Failed to send OTP email. Please contact admin.'}), 500
+
+        print(f'[OTP] Generated for {email or phone}: {otp}')
+        return jsonify({'message': 'OTP sent to your email', 'status': 'success'})
+
     except Exception as e:
-        print(f"Login Error: {e}")
-        return jsonify({"error": str(e)}), 500
+        print(f'[OTP] send error: {e}')
+        return jsonify({'error': str(e)}), 500
+
 
 @app.route('/api/login/verify', methods=['POST'])
 def verify_login_otp():
     try:
-        data = request.json
+        data  = request.json
         phone = data.get('phone')
         email = data.get('email')
-        role = data.get('role', 'student') 
-        
-        query = {"role": role}
+        otp   = data.get('otp', '').strip()
+        role  = data.get('role', 'student')
+
+        key = email or phone
+
+        # Verify OTP from DB
+        if otp:
+            otp_doc = db.otps.find_one({'email': key})
+            if not otp_doc:
+                return jsonify({'error': 'OTP expired or not found. Request a new one.'}), 401
+            if datetime.utcnow() > otp_doc.get('expires_at', datetime.min):
+                db.otps.delete_one({'email': key})
+                return jsonify({'error': 'OTP has expired. Please request a new one.'}), 401
+            if otp_doc.get('otp') != otp:
+                return jsonify({'error': 'Incorrect OTP. Please try again.'}), 401
+            # Valid — delete used OTP
+            db.otps.delete_one({'email': key})
+
+        # Fetch user
+        query = {'role': role}
         if email:
-            query["email"] = email
+            query['email'] = email
         else:
-            query["phone"] = phone
-            
+            query['phone'] = phone
+
         user = db.users.find_one(query)
-        
         if user:
-            return jsonify({"message": "Login successful", "user": serialize_doc(user)})
+            return jsonify({'message': 'Login successful', 'user': serialize_doc(user)})
         else:
-            return jsonify({"error": "Invalid User or Role Mismatch"}), 401
+            return jsonify({'error': 'Invalid User or Role Mismatch'}), 401
+
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({'error': str(e)}), 500
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
