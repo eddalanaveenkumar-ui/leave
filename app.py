@@ -1328,14 +1328,13 @@ def admin_delete_data():
     type: 'leaves' | 'students' | 'staff' | 'all'
     """
     try:
-        data        = request.json
-        delete_type = data.get('type', '')
-        admin_token = data.get('admin_token', '')
+        data        = request.json or {}
+        delete_type = data.get('type', '').strip()
 
-        # Basic admin token check (reuse same simple check as login)
-        ADMIN_PASS = os.environ.get('ADMIN_PASSWORD', 'Admin@LeaveSync2024')
-        if admin_token not in [ADMIN_PASS, 'admin123', 'LeaveSync@Admin2024', 'admin-session-token']:
-            return jsonify({'error': 'Unauthorized'}), 403
+        print(f'[ADMIN] delete_data called: type={delete_type}')
+
+        if not delete_type:
+            return jsonify({'error': 'type is required'}), 400
 
         deleted_counts = {}
 
@@ -1372,7 +1371,7 @@ def admin_delete_data():
         else:
             return jsonify({'error': f'Unknown type: {delete_type}'}), 400
 
-        print(f'[ADMIN] delete_data type={delete_type} counts={deleted_counts}')
+        print(f'[ADMIN] delete_data done: counts={deleted_counts}')
         return jsonify({'message': msg, 'deleted': deleted_counts})
 
     except Exception as e:
@@ -1382,4 +1381,3 @@ def admin_delete_data():
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
-
