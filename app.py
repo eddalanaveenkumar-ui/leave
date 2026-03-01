@@ -325,48 +325,6 @@ if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
 
 # --- API Endpoints ---
 
-# ══════════════════════════════════════════════════════════════════
-#  PUSH NOTIFICATION ENDPOINTS
-# ══════════════════════════════════════════════════════════════════
-
-@app.route('/api/save-fcm-token', methods=['POST'])
-def save_fcm_token():
-    """Called by each app on startup/permission grant to register the device FCM token."""
-    try:
-        data = request.json
-        token   = data.get('token')
-        role    = data.get('role', 'student')   # student | staff | parent | admin
-        user_id = data.get('userId', '')
-
-        if not token:
-            return jsonify({'error': 'Token required'}), 400
-
-        # Upsert: one token entry per device token
-        record = {
-            'token'    : token,
-            'role'     : role,
-            'userId'   : str(user_id),
-            'updatedAt': datetime.now()
-        }
-
-        # Use real MongoDB upsert if available
-        try:
-            db.fcm_tokens.update_one(
-                {'token': token},
-                {'$set': record},
-                upsert=True
-            )
-        except AttributeError:
-            # MockDB fallback
-            existing = db.fcm_tokens.find_one({'token': token})
-            if not existing:
-                db.fcm_tokens.insert_one(record)
-
-        print(f"[FCM] Token saved for role={role} userId={user_id}")
-        return jsonify({'message': 'Token saved', 'status': 'ok'})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
 
 @app.route('/api/send-notification', methods=['POST'])
 def send_notification():
