@@ -596,39 +596,52 @@ def _send_sms_twilio(to: str, body: str) -> bool:
 def twilio_send_otp():
     """
     Parent app calls this to trigger a Twilio OTP SMS.
-    Body: { phone: "+919xxxxxxxx", role: "parent" }
+    Body: { phone: "+919xxxxxxxx" }
+    The parent phone is stored in student documents under details.parent_phone
     """
     try:
-        data  = request.json
+        data  = request.get_json(silent=True) or {}
         phone = data.get('phone', '').strip()
-        role  = data.get('role', 'parent')
 
         if not phone:
             return jsonify({'error': 'Phone number is required'}), 400
 
-        # 1. Verify parent exists in DB
         norm_phone = _normalize_phone(phone)
-        user = db.users.find_one({'phone': {'$in': [phone, norm_phone]}, 'role': role})
-        if not user:
-            return jsonify({'error': 'Account not found. Please contact Admin.'}), 404
+        # Strip +91 prefix for DB lookup (stored as 10-digit or with +91)
+        digits_only = norm_phone.replace('+91', '')
 
-        # 2. Generate 6-digit OTP
+        # Look up student where parent_phone matches
+        student = db.users.find_one({
+            '$or': [
+                {'details.parent_phone': phone},
+                {'details.parent_phone': norm_phone},
+                {'details.parent_phone': digits_only},
+            ]
+        })
+
+        if not student:
+            print(f'[TWILIO] No student found for parent phone {norm_phone}')
+            return jsonify({'error': 'This phone number is not registered as a parent. Please contact Admin.'}), 404
+
+        # Generate 6-digit OTP
         otp = str(random.randint(100000, 999999))
         expires_at = time.time() + 300  # 5 minutes
+        _twilio_otp_store[norm_phone] = {
+            'otp': otp, 'expires_at': expires_at,
+            'student_id': str(student['_id'])
+        }
 
-        _twilio_otp_store[norm_phone] = {'otp': otp, 'expires_at': expires_at}
-
-        # 3. Send SMS
-        msg = f'Your LeaveSync verification code is: {otp}\nValid for 5 minutes. Do not share this OTP.'
+        # Send SMS
+        student_name = student.get('name', 'your ward')
+        msg = f'LeaveSync: Your login OTP is {otp}. Valid for 5 minutes. (For parent of {student_name})'
         sent = _send_sms_twilio(norm_phone, msg)
 
         if sent:
             print(f'[TWILIO] OTP {otp} sent to {norm_phone}')
             return jsonify({'message': 'OTP sent successfully', 'phone': norm_phone})
         else:
-            # Fallback: log OTP for testing
             print(f'[TWILIO FALLBACK] OTP for {norm_phone}: {otp}')
-            return jsonify({'message': 'OTP generated (check server logs)', 'phone': norm_phone})
+            return jsonify({'message': 'OTP generated', 'phone': norm_phone, 'otp_code': otp})
 
     except Exception as e:
         print(f'[TWILIO] send-otp error: {e}')
@@ -639,38 +652,53 @@ def twilio_send_otp():
 def twilio_verify_otp():
     """
     Parent app calls this to verify the OTP entered by the user.
-    Body: { phone: "+919xxxxxxxx", otp: "123456", role: "parent" }
+    Body: { phone: "+919xxxxxxxx", otp: "123456" }
     """
     try:
-        data  = request.json
+        data  = request.get_json(silent=True) or {}
         phone = _normalize_phone(data.get('phone', '').strip())
         otp   = data.get('otp', '').strip()
-        role  = data.get('role', 'parent')
+        digits_only = phone.replace('+91', '')
 
         if not phone or not otp:
             return jsonify({'error': 'Phone and OTP are required'}), 400
 
         record = _twilio_otp_store.get(phone)
-
         if not record:
             return jsonify({'error': 'OTP not found. Please request a new one.'}), 400
-
         if time.time() > record['expires_at']:
             _twilio_otp_store.pop(phone, None)
             return jsonify({'error': 'OTP expired. Please request a new one.'}), 400
-
         if record['otp'] != otp:
             return jsonify({'error': 'Invalid OTP. Please try again.'}), 400
 
-        # OTP valid — clear it and return user
+        # OTP valid — clear it
         _twilio_otp_store.pop(phone, None)
 
-        user = db.users.find_one({'phone': {'$in': [phone, data.get('phone','')]}, 'role': role})
-        if not user:
-            return jsonify({'error': 'User not found'}), 404
+        # Fetch student where parent_phone matches
+        student = db.users.find_one({
+            '$or': [
+                {'details.parent_phone': data.get('phone', '')},
+                {'details.parent_phone': phone},
+                {'details.parent_phone': digits_only},
+            ]
+        })
+        if not student:
+            return jsonify({'error': 'Parent record not found.'}), 404
 
-        print(f'[TWILIO] OTP verified for {phone}')
-        return jsonify({'message': 'OTP verified successfully', 'user': serialize_doc(user)})
+        # Build a parent user object from the student's data
+        parent_user = {
+            '_id':         str(student['_id']),
+            'name':        student.get('details', {}).get('parent_name', 'Parent'),
+            'phone':       phone,
+            'role':        'parent',
+            'student_id':  str(student['_id']),
+            'student_name':student.get('name', ''),
+            'department':  student.get('department', ''),
+        }
+
+        print(f'[TWILIO] OTP verified for parent of {student.get("name","")} ({phone})')
+        return jsonify({'message': 'Login successful', 'user': parent_user})
 
     except Exception as e:
         print(f'[TWILIO] verify-otp error: {e}')
