@@ -23,6 +23,38 @@ except ImportError:
     print("       Run: pip install firebase-admin")
 
 
+# ── Twilio SDK (for sending SMS) ──────────────────────────────────────────────
+TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID', '')
+TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN', '')
+# NOTE: Update with your purchased Twilio phone number:
+TWILIO_FROM_NUMBER = os.environ.get('TWILIO_FROM_NUMBER', '+12704580512')
+try:
+    from twilio.rest import Client
+    twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+except ImportError:
+    twilio_client = None
+    print("[WARN] Twilio not installed. SMS disabled. Run: pip install twilio")
+
+def send_sms(phone: str, body: str) -> bool:
+    if not twilio_client or not phone:
+        return False
+    try:
+        # If no country code, assume +91 (India) or default logic
+        clean_phone = phone.strip()
+        if not clean_phone.startswith('+'):
+            clean_phone = '+91' + clean_phone 
+        
+        twilio_client.messages.create(
+            body=body,
+            from_=TWILIO_FROM_NUMBER,
+            to=clean_phone
+        )
+        print(f"[SMS] Sent to {clean_phone}")
+        return True
+    except Exception as e:
+        print(f"[SMS] Error sending to {phone}: {e}")
+        return False
+
 app = Flask(__name__)
 CORS(app)
 
@@ -224,18 +256,30 @@ def send_push(token: str, title: str, body: str, data: dict = None) -> bool:
         print(f"[FCM] Send error for token {token[:20]}...: {e}")
         return False
 
-def send_push_to_user(user_id: str, title: str, body: str, data: dict = None):
-    """Send push to ALL devices registered for a userId."""
+def send_push_to_user(user_id: str, title: str, body: str, data: dict = None, target_role: str = None):
+    """Send push to ALL devices registered for a userId, optionally filtered by role."""
     uid = str(user_id)  # normalise to string
-    # Query by both exact userId AND string version (covers ObjectId stored as str)
-    tokens = list(db.fcm_tokens.find({'userId': uid}))
-    print(f"[FCM] send_push_to_user | userId={uid} | tokens_found={len(tokens)}")
+    query = {'userId': uid}
+    if target_role:
+        query['role'] = target_role
+    
+    tokens = list(db.fcm_tokens.find(query))
+    print(f"[FCM] send_push_to_user | userId={uid} | role={target_role} | tokens_found={len(tokens)}")
     sent = 0
     for t in tokens:
         if send_push(t['token'], title, body, data):
             sent += 1
     if sent == 0:
         print(f"[FCM] WARNING: No notifications sent for userId={uid}. Is the FCM token saved?")
+        
+    # --- Send SMS fallback/add-on ---
+    try:
+        user = db.users.find_one({'_id': ObjectId(uid)})
+        if user and user.get('phone'):
+            threading.Thread(target=send_sms, args=(user['phone'], f"{title}: {body}")).start()
+    except Exception as e:
+        print(f"[SMS] DB Lookup Error: {e}")
+
     return sent
 
 def send_push_to_role(role: str, title: str, body: str, data: dict = None):
@@ -243,7 +287,16 @@ def send_push_to_role(role: str, title: str, body: str, data: dict = None):
     tokens = list(db.fcm_tokens.find({'role': role}))
     for t in tokens:
         send_push(t['token'], title, body, data)
-
+        
+    # --- Send SMS to all users of this role ---
+    try:
+        users = list(db.users.find({'role': role}))
+        for u in users:
+            if u.get('phone'):
+                # Short delay or inline thread to prevent blocking
+                threading.Thread(target=send_sms, args=(u['phone'], f"{title}: {body}")).start()
+    except Exception as e:
+        print(f"[SMS] DB Role Lookup Error: {e}")
 
 # ── FCM Token Save Endpoint ───────────────────────────────────────────────────
 @app.route('/api/save-fcm-token', methods=['POST'])
@@ -320,9 +373,48 @@ def rotate_admin_creds():
         
         time.sleep(ADMIN_LOG_INTERVAL)
 
+# ── 3-minute Staff Reminder Thread ─────────────────────────────────────────────
+def staff_reminder_loop():
+    """Every 3 minutes, send push reminders to staff for pending leave requests."""
+    time.sleep(30)  # Initial delay to let server boot
+    while True:
+        try:
+            # Find pending_mentor requests
+            pending_mentor = list(db.leave_requests.find({'status': 'pending_mentor'}))
+            if pending_mentor:
+                count = len(pending_mentor)
+                try:
+                    send_push_to_role('mentor', '⏳ Reminder: Leave Approvals Needed',
+                        f'You have {count} pending leave request(s) waiting for your approval.',
+                        {'tag': 'pending', 'channel_id': 'leavesync_staff'})
+                except Exception as re:
+                    print(f'[Reminder] Mentor push error: {re}')
+
+            # Find pending_hod requests
+            pending_hod = list(db.leave_requests.find({'status': 'pending_hod'}))
+            if pending_hod:
+                count = len(pending_hod)
+                try:
+                    send_push_to_role('hod', '⏳ Reminder: HOD Approvals Needed',
+                        f'You have {count} pending leave request(s) waiting for HOD approval.',
+                        {'tag': 'pending', 'channel_id': 'leavesync_staff'})
+                except Exception as re:
+                    print(f'[Reminder] HOD push error: {re}')
+
+            if pending_mentor or pending_hod:
+                print(f'[Reminder] Sent group reminders: {len(pending_mentor)} mentor, {len(pending_hod)} HOD pending')
+        except Exception as e:
+            print(f'[Reminder] Loop error: {e}')
+
+        time.sleep(180)  # 3 minutes
+
+
 if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
     admin_thread = threading.Thread(target=rotate_admin_creds, daemon=True)
     admin_thread.start()
+    reminder_thread = threading.Thread(target=staff_reminder_loop, daemon=True)
+    reminder_thread.start()
+    print('[Server] Staff reminder thread started (every 3 min)')
 
 
 # --- API Endpoints ---
@@ -396,6 +488,136 @@ def broadcast_notification():
 
 # --- Login Endpoints ---
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PASSWORD-BASED LOGIN (Student & Staff)
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.route('/api/login/password', methods=['POST'])
+def login_with_password():
+    """Email + password login for students and staff (no OTP needed)."""
+    try:
+        data     = request.json or {}
+        email    = (data.get('email') or '').strip().lower()
+        password = (data.get('password') or '').strip()
+        role     = (data.get('role') or 'student').strip().lower()
+
+        if not email or '@' not in email:
+            return jsonify({'error': 'Valid email is required'}), 400
+        if not password:
+            return jsonify({'error': 'Password is required'}), 400
+
+        # Build query — staff roles map to mentor/hod/management
+        if role in ['mentor', 'hod', 'management']:
+            query = {'email': email, 'role': role}
+        elif role == 'staff':
+            query = {'email': email, 'role': {'$in': ['mentor', 'hod', 'management']}}
+        else:
+            query = {'email': email, 'role': 'student'}
+
+        user = db.users.find_one(query)
+        if not user:
+            # Try broader search (any role with that email)
+            any_user = db.users.find_one({'email': email})
+            if any_user:
+                actual_role = any_user.get('role', '?')
+                if actual_role == 'student' and role != 'student':
+                    return jsonify({'error': 'You are a Student. Please use the Student Portal.'}), 403
+                elif actual_role != 'student' and role == 'student':
+                    return jsonify({'error': f'You are registered as {actual_role}. Please use the Staff Portal.'}), 403
+                else:
+                    return jsonify({'error': f'Role mismatch. You are registered as {actual_role}.'}), 403
+            return jsonify({'error': 'Account not found. Please contact Admin.'}), 404
+
+        # Check password — stored in details.password
+        stored_pw = (user.get('details', {}) or {}).get('password', '')
+        if not stored_pw:
+            # No password set — allow login with any password (first-time/migration)
+            # Set the password for future logins
+            db.users.update_one({'_id': user['_id']}, {'$set': {'details.password': password}})
+            print(f'[LOGIN] First-time password set for {email}')
+        elif stored_pw != password:
+            return jsonify({'error': 'Incorrect password'}), 401
+
+        print(f'[LOGIN] Password login success: {email} / {user.get("role")}')
+        return jsonify({'message': 'Login successful', 'user': serialize_doc(user)})
+
+    except Exception as e:
+        print(f'[LOGIN] password error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  FIREBASE PHONE AUTH LOGIN (Parent)
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.route('/api/login/firebase-phone', methods=['POST'])
+def login_firebase_phone():
+    """Verify Firebase phone auth ID token and return parent user."""
+    try:
+        data     = request.json or {}
+        phone    = (data.get('phone') or '').strip()
+        id_token = (data.get('firebase_id_token') or '').strip()
+
+        if not phone:
+            return jsonify({'error': 'Phone number is required'}), 400
+
+        # Verify Firebase ID token if available
+        verified_phone = phone
+        if id_token and _FCM_AVAILABLE:
+            try:
+                from firebase_admin import auth as fb_auth
+                decoded = fb_auth.verify_id_token(id_token)
+                verified_phone = decoded.get('phone_number', phone)
+                print(f'[Firebase Phone] Verified: {verified_phone}')
+            except Exception as ve:
+                print(f'[Firebase Phone] Token verification error (proceeding anyway): {ve}')
+
+        # Normalize phone for lookup
+        norm_phone = verified_phone.replace('+91', '').replace('+', '').strip()
+        if norm_phone.startswith('0'):
+            norm_phone = norm_phone[1:]
+
+        # Find parent user by phone
+        parent = db.users.find_one({
+            'role': 'parent',
+            '$or': [
+                {'phone': verified_phone},
+                {'phone': norm_phone},
+                {'phone': '+91' + norm_phone},
+            ]
+        })
+
+        if not parent:
+            # Try finding via student's parent_phone
+            student = db.users.find_one({
+                '$or': [
+                    {'details.parent_phone': verified_phone},
+                    {'details.parent_phone': norm_phone},
+                    {'details.parent_phone': '+91' + norm_phone},
+                ]
+            })
+            if student:
+                # Create or find parent from student data
+                parent = db.users.find_one({'role': 'parent', 'phone': {'$in': [verified_phone, norm_phone, '+91' + norm_phone]}})
+                if not parent:
+                    # Auto-create parent
+                    p_name = student.get('details', {}).get('parent_name', 'Parent')
+                    result = db.users.insert_one({
+                        'role': 'parent', 'name': p_name, 'phone': verified_phone,
+                        'details': {'children': [str(student['_id'])]},
+                        'created_at': datetime.now()
+                    })
+                    parent = db.users.find_one({'_id': result.inserted_id})
+
+        if not parent:
+            return jsonify({'error': 'Phone number not registered. Please contact Admin.'}), 404
+
+        print(f'[LOGIN] Firebase phone login success: {verified_phone} / parent')
+        return jsonify({'message': 'Login successful', 'user': serialize_doc(parent)})
+
+    except Exception as e:
+        print(f'[LOGIN] firebase-phone error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
 # ── EmailJS OTP Helpers ──────────────────────────────────────────────────────
 # EmailJS: free 200 emails/month, no domain needed — just connect Gmail
 EMAILJS_SERVICE_ID  = os.environ.get('EMAILJS_SERVICE_ID',  '')
@@ -407,7 +629,7 @@ def send_otp_email(to_email: str, otp: str, name: str = '') -> bool:
     """Send a 6-digit OTP via EmailJS HTTP API (free, no domain verification needed)."""
     try:
         if not all([EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, EMAILJS_PUBLIC_KEY, EMAILJS_PRIVATE_KEY]):
-            print('[OTP] EmailJS credentials not set. Falling back to on-screen OTP.')
+            print('[OTP] EmailJS credentials not set. Falling back to on-screen OTP (Server Side Only).')
             return False
 
         payload = json.dumps({
@@ -418,6 +640,8 @@ def send_otp_email(to_email: str, otp: str, name: str = '') -> bool:
             'template_params': {
                 'to_email':  to_email,
                 'otp_code':  otp,
+                'otp':       otp,
+                'message':   otp,
                 'user_name': name or to_email.split('@')[0],
             }
         }).encode('utf-8')
@@ -485,21 +709,26 @@ def send_login_otp():
             upsert=True
         )
 
-        # Send via Resend
+        # Send via EmailJS or Twilio
         name = user.get('name', '')
-        sent = send_otp_email(email or '', otp, name) if email else False
-
-        print(f'[OTP] Generated for {email or phone}: {otp} | email_sent={sent}')
+        sent = False
+        if email:
+            sent = send_otp_email(email, otp, name)
+            print(f'[OTP] Generated for {email}: {otp} | email_sent={sent}')
+        elif phone:
+            msg = f"Your LeaveSync verification code is {otp}. Valid for 10 minutes."
+            if twilio_client:
+                send_sms(phone, msg)
+                sent = True
+            print(f'[OTP] Generated for {phone}: {otp} | sms_sent={sent}')
 
         if sent:
-            return jsonify({'message': 'OTP sent to your email', 'status': 'success'})
+            method_str = "email" if email else "phone"
+            return jsonify({'message': f'OTP sent to your {method_str}', 'status': 'success'})
         else:
-            # Email not configured yet — return OTP directly so admin/users can still log in
-            # Once RESEND_API_KEY is set in environment, OTP will be emailed instead
             return jsonify({
-                'message': 'Email not configured. Use the code below to log in.',
-                'status': 'fallback',
-                'otp_code': otp   # shown in app when email is not set up
+                'message': 'Unable to send OTP. If this is a test environment, check server logs.',
+                'status': 'fallback'
             })
 
     except Exception as e:
@@ -641,7 +870,7 @@ def twilio_send_otp():
             return jsonify({'message': 'OTP sent successfully', 'phone': norm_phone})
         else:
             print(f'[TWILIO FALLBACK] OTP for {norm_phone}: {otp}')
-            return jsonify({'message': 'OTP generated', 'phone': norm_phone, 'otp_code': otp})
+            return jsonify({'message': 'Unable to send SMS. Check server logs if this is a test context.', 'phone': norm_phone})
 
     except Exception as e:
         print(f'[TWILIO] send-otp error: {e}')
@@ -1024,6 +1253,21 @@ def apply_leave():
         }
         
         result = db.leave_requests.insert_one(leave_request)
+        
+        try:
+            student = db.users.find_one({'_id': ObjectId(student_id)})
+            sname = student['name'] if student else 'A student'
+            # Notify student
+            send_push_to_user(student_id, '📨 Leave Request Submitted',
+                'Your leave request has been sent to your parent for approval.',
+                {'tag': 'pending', 'channel_id': 'leavesync_student'}, target_role='student')
+            # Notify parent
+            send_push_to_user(student_id, '🔔 New Leave Request',
+                f'{sname} has submitted a new leave request for your approval.',
+                {'tag': 'pending', 'channel_id': 'leavesync_parent'}, target_role='parent')
+        except Exception as e:
+            print("[FCM] apply_leave push error:", e)
+
         return jsonify({"message": "Leave request submitted", "id": str(result.inserted_id)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1043,17 +1287,47 @@ def parent_approve():
         {'$set': {'status': 'pending_mentor', 'parent_approved': True}}
     )
 
-    # Push to student
+    # Push to student & mentor
     try:
         req = db.leave_requests.find_one({'_id': ObjectId(req_id)})
         if req:
             send_push_to_user(req['student_id'],
                 '✅ Parent Approved',
                 'Your parent approved your leave. Sent to class advisor.',
-                {'tag': 'approved', 'url': '/dashboard.html'})
-    except Exception: pass
+                {'tag': 'approved', 'url': '/dashboard.html', 'channel_id': 'leavesync_student'}, target_role='student')
+            
+            student = db.users.find_one({'_id': ObjectId(req['student_id'])})
+            sname = student['name'] if student else 'A student'
+            send_push_to_role('staff', '🏫 Leave Approval Needed',
+                f'{sname} needs advisor approval for their leave request.', 
+                {'tag': 'pending', 'channel_id': 'leavesync_staff'})
+    except Exception as e:
+        print("[FCM] parent_approve push error:", e)
 
     return jsonify({'message': 'Approved by Parent. Sent to Mentor.'})
+
+@app.route('/api/parent/reject', methods=['POST'])
+def parent_reject():
+    data   = request.json
+    req_id = data.get('request_id')
+
+    db.leave_requests.update_one(
+        {'_id': ObjectId(req_id)},
+        {'$set': {'status': 'rejected_by_parent', 'parent_approved': False}}
+    )
+
+    # Push to student
+    try:
+        req = db.leave_requests.find_one({'_id': ObjectId(req_id)})
+        if req:
+            send_push_to_user(req['student_id'],
+                '❌ Leave Declined',
+                'Your parent has declined your leave request.',
+                {'tag': 'rejected', 'url': '/dashboard.html', 'channel_id': 'leavesync_student'}, target_role='student')
+    except Exception as e:
+        print("[FCM] parent_reject push error:", e)
+
+    return jsonify({'message': 'Declined by Parent.'})
 
 @app.route('/api/mentor/requests', methods=['GET'])
 def get_mentor_requests():
@@ -1070,17 +1344,46 @@ def mentor_approve():
         {'$set': {'status': 'pending_hod', 'mentor_approved': True}}
     )
 
-    # Push to student
+    # Push to student & HOD (staff)
     try:
         req = db.leave_requests.find_one({'_id': ObjectId(req_id)})
         if req:
             send_push_to_user(req['student_id'],
                 '⏳ Advisor Approved',
                 'Your class advisor approved your leave. Awaiting HOD approval.',
-                {'tag': 'pending', 'url': '/dashboard.html'})
-    except Exception: pass
+                {'tag': 'pending', 'url': '/dashboard.html', 'channel_id': 'leavesync_student'}, target_role='student')
+            
+            student = db.users.find_one({'_id': ObjectId(req['student_id'])})
+            sname = student['name'] if student else 'A student'
+            send_push_to_role('staff', '🏫 Leave Approval Needed from HOD',
+                f'{sname} needs HOD approval for their leave request.', 
+                {'tag': 'pending', 'channel_id': 'leavesync_staff'})
+    except Exception as e:
+        print("[FCM] mentor_approve push error:", e)
 
     return jsonify({'message': 'Approved by Mentor. Sent to HOD.'})
+
+@app.route('/api/mentor/reject', methods=['POST'])
+def mentor_reject():
+    data   = request.json
+    req_id = data.get('request_id')
+
+    db.leave_requests.update_one(
+        {'_id': ObjectId(req_id)},
+        {'$set': {'status': 'rejected_by_mentor', 'mentor_approved': False}}
+    )
+
+    try:
+        req = db.leave_requests.find_one({'_id': ObjectId(req_id)})
+        if req:
+            send_push_to_user(req['student_id'],
+                '❌ Leave Declined',
+                'Your class advisor has declined your leave request.',
+                {'tag': 'rejected', 'url': '/dashboard.html', 'channel_id': 'leavesync_student'}, target_role='student')
+    except Exception as e:
+        print("[FCM] mentor_reject push error:", e)
+
+    return jsonify({'message': 'Declined by Mentor.'})
 
 @app.route('/api/hod/requests', methods=['GET'])
 def get_hod_requests():
@@ -1182,6 +1485,27 @@ def hod_approve():
         print(f'HOD Approve Error: {e}')
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/hod/reject', methods=['POST'])
+def hod_reject():
+    data   = request.json
+    req_id = data.get('request_id')
+
+    db.leave_requests.update_one(
+        {'_id': ObjectId(req_id)},
+        {'$set': {'status': 'rejected_by_hod', 'hod_approved': False}}
+    )
+
+    try:
+        req = db.leave_requests.find_one({'_id': ObjectId(req_id)})
+        if req:
+            send_push_to_user(req['student_id'],
+                '❌ Leave Declined',
+                'The HOD has declined your leave request.',
+                {'tag': 'rejected', 'url': '/dashboard.html', 'channel_id': 'leavesync_student'}, target_role='student')
+    except Exception as e:
+        print("[FCM] hod_reject push error:", e)
+
+    return jsonify({'message': 'Declined by HOD.'})
 
 @app.route('/api/validate_pass', methods=['POST'])
 def validate_pass():
