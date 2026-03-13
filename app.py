@@ -227,11 +227,27 @@ def _init_firebase():
 _init_firebase()
 
 # ── Helper: send push notification via FCM ────────────────────────────────────
-def send_push(token: str, title: str, body: str, data: dict = None) -> bool:
+# Channel IDs must match the Android NotificationChannel IDs in each app
+_CHANNEL_MAP = {
+    'student': 'leavesync_student',
+    'staff':   'leavesync_staff',
+    'mentor':  'leavesync_staff',
+    'hod':     'leavesync_staff',
+    'management': 'leavesync_staff',
+    'parent':  'leavesync_parent',
+    'admin':   'leavesync_admin',
+}
+
+def send_push(token: str, title: str, body: str, data: dict = None, role: str = None) -> bool:
     """Send a single push notification to a device token. Returns True on success."""
     if not _firebase_initialized:
         return False
     try:
+        # Determine correct channel ID for Android
+        channel_id = _CHANNEL_MAP.get(role, 'leavesync_student')
+        if data and data.get('channel_id'):
+            channel_id = data['channel_id']
+
         msg = fcm_messaging.Message(
             notification=fcm_messaging.Notification(title=title, body=body),
             data={k: str(v) for k, v in (data or {}).items()},
@@ -239,8 +255,7 @@ def send_push(token: str, title: str, body: str, data: dict = None) -> bool:
                 priority='high',
                 notification=fcm_messaging.AndroidNotification(
                     sound='default',
-                    channel_id=data.get('channel_id', 'leavesync_student') if data else 'leavesync_student',
-                    click_action='FLUTTER_NOTIFICATION_CLICK'
+                    channel_id=channel_id
                 )
             ),
             apns=fcm_messaging.APNSConfig(
@@ -267,7 +282,8 @@ def send_push_to_user(user_id: str, title: str, body: str, data: dict = None, ta
     print(f"[FCM] send_push_to_user | userId={uid} | role={target_role} | tokens_found={len(tokens)}")
     sent = 0
     for t in tokens:
-        if send_push(t['token'], title, body, data):
+        token_role = t.get('role', target_role)
+        if send_push(t['token'], title, body, data, role=token_role):
             sent += 1
     if sent == 0:
         print(f"[FCM] WARNING: No notifications sent for userId={uid}. Is the FCM token saved?")
@@ -286,7 +302,7 @@ def send_push_to_role(role: str, title: str, body: str, data: dict = None):
     """Broadcast push to all devices of users with a given role."""
     tokens = list(db.fcm_tokens.find({'role': role}))
     for t in tokens:
-        send_push(t['token'], title, body, data)
+        send_push(t['token'], title, body, data, role=role)
         
     # --- Send SMS to all users of this role ---
     try:
