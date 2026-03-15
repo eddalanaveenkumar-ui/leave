@@ -691,10 +691,10 @@ def reset_firebase_user():
         except Exception as e:
             print(f"[Firebase Reset] User not found or delete error: {e}")
 
-        # 3) Recreate with the correct password
+        # 3) Recreate with the correct password AND mark email as verified
         try:
-            fb_auth.create_user(email=email, password=password)
-            print(f"[Firebase Reset] Recreated user {email}")
+            fb_auth.create_user(email=email, password=password, email_verified=True)
+            print(f"[Firebase Reset] Recreated user {email} (email_verified=True)")
             return jsonify({'status': 'recreated', 'message': 'Firebase user recreated with synced password'})
         except Exception as e:
             print(f"[Firebase Reset] Create error: {e}")
@@ -702,6 +702,35 @@ def reset_firebase_user():
 
     except Exception as e:
         print(f"[Firebase Reset] Error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/login/verify-firebase-email', methods=['POST'])
+def verify_firebase_email():
+    """Use Firebase Admin SDK to directly mark a user's email as verified.
+    This avoids needing Firebase Hosting for the verification link page."""
+    try:
+        data = request.json or {}
+        email = data.get('email')
+
+        if not email:
+            return jsonify({'error': 'Email is required'}), 400
+
+        if not _FCM_AVAILABLE:
+            return jsonify({'error': 'Firebase Admin SDK not available'}), 500
+
+        from firebase_admin import auth as fb_auth
+
+        try:
+            fb_user = fb_auth.get_user_by_email(email)
+            fb_auth.update_user(fb_user.uid, email_verified=True)
+            print(f"[Firebase Verify] Marked {email} as verified")
+            return jsonify({'status': 'verified', 'message': 'Email verified successfully'})
+        except Exception as e:
+            print(f"[Firebase Verify] Error: {e}")
+            return jsonify({'error': str(e)}), 500
+
+    except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 
