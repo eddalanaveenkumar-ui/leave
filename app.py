@@ -666,6 +666,45 @@ def send_smtp_email(to_email: str, subject: str, html_content: str) -> bool:
         return False
 
 
+@app.route('/api/login/reset-firebase-user', methods=['POST'])
+def reset_firebase_user():
+    """Delete and recreate a Firebase Auth user to sync password with MongoDB."""
+    try:
+        data = request.json or {}
+        email = data.get('email')
+        password = data.get('password')
+
+        if not email or not password:
+            return jsonify({'error': 'Email and password required'}), 400
+
+        if not _FCM_AVAILABLE:
+            return jsonify({'error': 'Firebase Admin SDK not available'}), 500
+
+        from firebase_admin import auth as fb_auth
+
+        # 1) Try to find existing Firebase user
+        try:
+            fb_user = fb_auth.get_user_by_email(email)
+            # 2) Delete the existing user
+            fb_auth.delete_user(fb_user.uid)
+            print(f"[Firebase Reset] Deleted user {email}")
+        except Exception as e:
+            print(f"[Firebase Reset] User not found or delete error: {e}")
+
+        # 3) Recreate with the correct password
+        try:
+            fb_auth.create_user(email=email, password=password)
+            print(f"[Firebase Reset] Recreated user {email}")
+            return jsonify({'status': 'recreated', 'message': 'Firebase user recreated with synced password'})
+        except Exception as e:
+            print(f"[Firebase Reset] Create error: {e}")
+            return jsonify({'error': str(e)}), 500
+
+    except Exception as e:
+        print(f"[Firebase Reset] Error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/login/send-firebase-link', methods=['POST'])
 def send_firebase_link():
     """Generates a Firebase Verification Link and sends it reliably via SMTP."""
