@@ -437,18 +437,16 @@ if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
 
 @app.route('/api/test-email', methods=['GET', 'POST'])
 def test_email():
-    """Diagnostic: test EmailJS config and send a test OTP email."""
+    """Diagnostic: test SMTP config and send a test email."""
     body = request.get_json(silent=True) or {}
     to = request.args.get('to') or body.get('to', '')
     config_status = {
-        'EMAILJS_SERVICE_ID':  bool(EMAILJS_SERVICE_ID),
-        'EMAILJS_TEMPLATE_ID': bool(EMAILJS_TEMPLATE_ID),
-        'EMAILJS_PUBLIC_KEY':  bool(EMAILJS_PUBLIC_KEY),
-        'EMAILJS_PRIVATE_KEY': bool(EMAILJS_PRIVATE_KEY),
+        'SMTP_EMAIL':  bool(SMTP_EMAIL),
+        'SMTP_PASSWORD': bool(SMTP_PASSWORD)
     }
     if not to:
         return jsonify({'config': config_status, 'note': 'Add ?to=youremail@gmail.com to send a test'})
-    sent = send_otp_email(to, '123456', 'Test User')
+    sent = send_smtp_email(to, 'Test Email from LeaveSync', '<p>If you see this, SMTP is working!</p>')
     return jsonify({'config': config_status, 'sent': sent, 'to': to})
 
 
@@ -634,61 +632,43 @@ def login_firebase_phone():
         return jsonify({'error': str(e)}), 500
 
 
-# ── EmailJS OTP Helpers ──────────────────────────────────────────────────────
-# EmailJS: free 200 emails/month, no domain needed — just connect Gmail
-EMAILJS_SERVICE_ID  = os.environ.get('EMAILJS_SERVICE_ID',  '')
-EMAILJS_TEMPLATE_ID = os.environ.get('EMAILJS_TEMPLATE_ID', '')
-EMAILJS_PUBLIC_KEY  = os.environ.get('EMAILJS_PUBLIC_KEY',  '')
-EMAILJS_PRIVATE_KEY = os.environ.get('EMAILJS_PRIVATE_KEY', '')
+# ── SMTP Email Helpers ────────────────────────────────────────────────────────
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
-def send_otp_email(to_email: str, otp: str, name: str = '') -> bool:
-    """Send a 6-digit OTP via EmailJS HTTP API (free, no domain verification needed)."""
+SMTP_EMAIL = os.environ.get('SMTP_EMAIL', '')
+SMTP_PASSWORD = os.environ.get('SMTP_PASSWORD', '')
+
+def send_smtp_email(to_email: str, subject: str, html_content: str) -> bool:
+    """Send an email using standard SMTP (e.g., Gmail App Password)."""
     try:
-        if not all([EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, EMAILJS_PUBLIC_KEY, EMAILJS_PRIVATE_KEY]):
-            print('[OTP] EmailJS credentials not set. Falling back to on-screen OTP (Server Side Only).')
+        if not SMTP_EMAIL or not SMTP_PASSWORD:
+            print('[SMTP] SMTP_EMAIL or SMTP_PASSWORD not set. Cannot send email.')
             return False
 
-        payload = json.dumps({
-            'service_id':   EMAILJS_SERVICE_ID,
-            'template_id':  EMAILJS_TEMPLATE_ID,
-            'user_id':      EMAILJS_PUBLIC_KEY,
-            'accessToken':  EMAILJS_PRIVATE_KEY,
-            'template_params': {
-                'to_email':  to_email,
-                'otp_code':  otp,
-                'otp':       otp,
-                'message':   otp,
-                'user_name': name or to_email.split('@')[0],
-            }
-        }).encode('utf-8')
+        msg = MIMEMultipart()
+        msg['From'] = SMTP_EMAIL
+        msg['To'] = to_email
+        msg['Subject'] = subject
+        msg.attach(MIMEText(html_content, 'html'))
 
-        req = urllib.request.Request(
-            'https://api.emailjs.com/api/v1.0/email/send',
-            data=payload,
-            headers={
-                'Content-Type': 'application/json',
-                'Origin': 'https://leave-jgu0.onrender.com'
-            },
-            method='POST'
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            status = resp.status
-        print(f'[OTP] EmailJS response: {status} → {to_email}')
-        return status == 200
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(SMTP_EMAIL, SMTP_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        print(f"[SMTP] Email sent to {to_email}")
+        return True
 
-    except urllib.error.HTTPError as e:
-        body = e.read().decode('utf-8', errors='replace')
-        print(f'[OTP] EmailJS HTTP error {e.code}: {body}')
-        return False
     except Exception as e:
-        print(f'[OTP] send_otp_email error: {e}')
+        print(f'[SMTP] send error: {e}')
         return False
-
 
 
 @app.route('/api/login/send-firebase-link', methods=['POST'])
 def send_firebase_link():
-    """Generates a Firebase Verification Link and sends it reliably via EmailJS."""
+    """Generates a Firebase Verification Link and sends it reliably via SMTP."""
     try:
         data  = request.json or {}
         email = data.get('email')
@@ -708,14 +688,28 @@ def send_firebase_link():
         except Exception as e:
             return jsonify({'error': f'Failed to generate link: {e}', 'details': str(e)}), 500
         
-        # 2) Send it by tricking the existing EmailJS template (passing link as the message/OTP)
-        sent = send_otp_email(to_email=email, otp=link, name=email.split('@')[0])
+        # 2) Send it elegantly via direct SMTP
+        subject = "Log in to LeaveSync Staff Portal"
+        html_content = f"""
+        <div style="font-family: sans-serif; padding: 20px; background: #f9fafb; border-radius: 8px;">
+            <h2 style="color: #111827;">LeaveSync Portal Login</h2>
+            <p style="color: #374151; font-size: 16px;">You requested to sign in to your LeaveSync account.</p>
+            <p style="color: #374151; font-size: 16px;">Please click the secure button below to verify your email and complete your sign in:</p>
+            <div style="margin: 30px 0;">
+                <a href="{link}" style="display:inline-block; padding:12px 24px; background-color:#10b981; color:white; text-decoration:none; border-radius:8px; font-weight:bold; font-size: 16px; box-shadow: 0 4px 6px rgba(16,185,129,0.2);">Verify & Sign In</a>
+            </div>
+            <p style="margin-top: 30px; font-size: 13px; color:#6b7280;">If the button doesn't work, copy and paste this link into your browser:<br><br><a href="{link}" style="word-break: break-all; color: #10b981;">{link}</a></p>
+            <p style="margin-top: 20px; font-size: 13px; color:#9ca3af;">If you didn't request this, you can safely ignore this email.</p>
+        </div>
+        """
+        
+        sent = send_smtp_email(to_email=email, subject=subject, html_content=html_content)
         
         if sent:
-            return jsonify({'message': 'Verification link sent via EmailJS', 'status': 'success', 'test_link': link})
+            return jsonify({'message': 'Verification link sent directly to your inbox', 'status': 'success', 'test_link': link})
         else:
             return jsonify({
-                'message': 'No EmailJS credentials. Link generated successfully but not sent to inbox.',
+                'message': 'No SMTP credentials configued. Link generated but not sent via email.',
                 'status': 'fallback',
                 'test_link': link
             })
@@ -764,11 +758,20 @@ def send_login_otp():
             upsert=True
         )
 
-        # Send via EmailJS or Twilio
+        # Send via Email (SMTP) or Twilio
         name = user.get('name', '')
         sent = False
         if email:
-            sent = send_otp_email(email, otp, name)
+            subject = "LeaveSync Verification OTP"
+            html_content = f"""
+            <div style="font-family: sans-serif; padding: 20px; background: #f9fafb; border-radius: 8px;">
+                <h2 style="color: #111827;">LeaveSync Verification</h2>
+                <p style="color: #374151; font-size: 16px;">Hello {name or email.split('@')[0]},</p>
+                <p style="color: #374151; font-size: 16px;">Your verification code is: <strong style="font-size: 24px; color: #10b981; letter-spacing: 2px;">{otp}</strong></p>
+                <p style="margin-top: 30px; font-size: 13px; color:#6b7280;">This code is valid for 10 minutes. If you didn't request this, please ignore it.</p>
+            </div>
+            """
+            sent = send_smtp_email(email, subject, html_content)
             print(f'[OTP] Generated for {email}: {otp} | email_sent={sent}')
         elif phone:
             msg = f"Your LeaveSync verification code is {otp}. Valid for 10 minutes."
@@ -779,11 +782,12 @@ def send_login_otp():
 
         if sent:
             method_str = "email" if email else "phone"
-            return jsonify({'message': f'OTP sent to your {method_str}', 'status': 'success'})
+            return jsonify({'message': f'OTP sent directly to your {method_str}', 'status': 'success'})
         else:
             return jsonify({
-                'message': 'Unable to send OTP. If this is a test environment, check server logs.',
-                'status': 'fallback'
+                'message': f'No SMTP credentials configured. Test OTP is {otp}',
+                'status': 'fallback',
+                'test_otp': otp
             })
 
     except Exception as e:
