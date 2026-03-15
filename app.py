@@ -686,6 +686,45 @@ def send_otp_email(to_email: str, otp: str, name: str = '') -> bool:
 
 
 
+@app.route('/api/login/send-firebase-link', methods=['POST'])
+def send_firebase_link():
+    """Generates a Firebase Verification Link and sends it reliably via EmailJS."""
+    try:
+        data  = request.json or {}
+        email = data.get('email')
+        
+        if not email:
+            return jsonify({'error': 'Email is required'}), 400
+
+        if not _FCM_AVAILABLE:
+            return jsonify({'error': 'Firebase Admin SDK not initialized.'}), 500
+
+        from firebase_admin import auth as fb_auth
+        
+        # 1) Generate the Firebase Auth email link
+        try:
+            link = fb_auth.generate_email_verification_link(email)
+            print(f"[Firebase Link] Generated for {email}")
+        except Exception as e:
+            return jsonify({'error': f'Failed to generate link: {e}', 'details': str(e)}), 500
+        
+        # 2) Send it by tricking the existing EmailJS template (passing link as the message/OTP)
+        sent = send_otp_email(to_email=email, otp=link, name=email.split('@')[0])
+        
+        if sent:
+            return jsonify({'message': 'Verification link sent via EmailJS', 'status': 'success', 'test_link': link})
+        else:
+            return jsonify({
+                'message': 'No EmailJS credentials. Link generated successfully but not sent to inbox.',
+                'status': 'fallback',
+                'test_link': link
+            })
+            
+    except Exception as e:
+        print(f"[Firebase Link] send error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/login/otp', methods=['POST'])
 def send_login_otp():
     try:
