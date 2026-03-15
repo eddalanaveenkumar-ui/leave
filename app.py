@@ -220,7 +220,7 @@ def _init_firebase():
         if not firebase_admin._apps:
             firebase_admin.initialize_app(cred)
         _firebase_initialized = True
-        print("[FCM] Firebase Admin SDK initialized ✓")
+        print("[FCM] Firebase Admin SDK initialized successfully")
     except Exception as e:
         print(f"[FCM] Firebase init error: {e}")
 
