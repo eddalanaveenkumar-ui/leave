@@ -743,8 +743,9 @@ def send_login_otp():
             return jsonify({'message': f'OTP sent to your {method_str}', 'status': 'success'})
         else:
             return jsonify({
-                'message': 'Unable to send OTP. If this is a test environment, check server logs.',
-                'status': 'fallback'
+                'message': f'No EmailJS credentials. Test OTP is {otp}',
+                'status': 'fallback',
+                'test_otp': otp
             })
 
     except Exception as e:
